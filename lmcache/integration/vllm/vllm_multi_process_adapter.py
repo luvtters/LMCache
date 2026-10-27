@@ -951,7 +951,19 @@ class LMCacheMPSchedulerAdapter:
 
         # Do not wait for the acknowledgement here: that is a full server
         # round trip on the scheduler thread.
-        lookup = LookupState(
+        lookup = self._create_lookup_state(key)
+        self._lookups[request_id] = lookup
+        lookup.submit()
+        return True
+
+    def _create_lookup_state(self, key: IPCCacheServerKey) -> LookupState:
+        """Build the per-request lookup operation for an aligned key.
+
+        Subclasses can supply a lookup implementation with the same
+        submit/poll/close/drain lifecycle while retaining scheduler bookkeeping.
+        The default continues to use the standard MP lookup protocol.
+        """
+        return LookupState(
             key,
             self.req_clients,
             tp_size=self.tp_size,
@@ -959,9 +971,6 @@ class LMCacheMPSchedulerAdapter:
             timeout=self._mq_timeout,
             blocking_lookup=not self._nonblocking_lookup_status,
         )
-        self._lookups[request_id] = lookup
-        lookup.submit()
-        return True
 
     @_lmcache_nvtx_annotate
     def check_lookup_result(self, request_id: str) -> int | None:
