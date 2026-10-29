@@ -15,7 +15,7 @@ def methods(relative, class_name, names, *, bases=(), namespace=None):
     if len(body) != len(names):
         raise AssertionError('Requested shutdown method missing')
     node = ast.ClassDef(name=class_name, bases=[ast.Name(id=n, ctx=ast.Load()) for n in bases],
-                        keywords=[], body=body, decorator_list=[])
+                        keywords=[], body=body, decorator_list=[], type_params=[])
     module = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
     scope = dict(namespace or {})
     exec(compile(module, str(ROOT / relative), 'exec'), scope)
