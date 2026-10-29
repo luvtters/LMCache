@@ -295,6 +295,16 @@ class LookupState:
             RemoteRequestError: The server explicitly failed this lookup.
         """
         with self._lock:
+            # A future becomes done before its callbacks run. Observe an
+            # already completed failure here as well, without waiting or
+            # sending RPCs, so a concurrent unhealthy fast path cannot hide it.
+            if self._result is None:
+                for url, server in self._servers.items():
+                    future = server.future
+                    if (future is not None and future.query()
+                            and isinstance(future.exception_, RemoteRequestError)):
+                        self._fail_remote_request(url, future.exception_)
+                        break
             if self._error is not None:
                 raise self._error
             return self._result

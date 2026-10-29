@@ -8,6 +8,7 @@ import threading
 from types import SimpleNamespace
 import unittest
 import uuid
+from unittest.mock import patch
 
 import zmq
 
@@ -134,6 +135,30 @@ class ExplicitPrefetchFailureChecks(unittest.TestCase):
         self.assertEqual(client.queries, [])
         with self.assertRaisesRegex(RemoteRequestError, "peer left"):
             state.get_result()
+
+    def test_done_error_with_delayed_callback_survives_unhealthy_fast_path(self):
+        from lmcache.integration.vllm.vllm_multi_process_adapter import (
+            LMCacheMPSchedulerAdapter,
+        )
+        client = FakeClient()
+        state = lookup_state(client)
+        state.submit()
+        client.lookups[0].set_result(None)
+        deadline = state._servers["cpu-server"].deadline
+        future = client.queries[0]
+        with patch.object(future, "_run_callback") as delayed:
+            future.set_exception(RemoteRequestError("BM peer rank 1 left"))
+        self.assertTrue(future.query())
+        delayed.assert_called_once()
+        self.assertIsNone(state._error)
+        scheduler = LMCacheMPSchedulerAdapter.__new__(LMCacheMPSchedulerAdapter)
+        scheduler._lookups = {"failed-request": state}
+        scheduler._health_events = {"cpu-server": threading.Event()}
+        self.assertFalse(scheduler.is_healthy)
+        with self.assertRaisesRegex(RemoteRequestError, "BM peer rank 1 left"):
+            scheduler.check_lookup_result("failed-request")
+        self.assertEqual(len(client.queries), 1)
+        self.assertEqual(state._servers["cpu-server"].deadline, deadline)
 
     def test_normal_pending_and_zero_miss_are_unchanged(self):
         client = FakeClient()
