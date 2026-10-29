@@ -84,6 +84,10 @@ def create_transfer_channel_context(
     Raises:
         ValueError: If no factory is registered for ``transfer_channel_type``.
     """
+    # Load optional native backends only when a transfer context is requested,
+    # not when RPC clients import the transfer-channel address types.
+    import lmcache.v1.distributed.transfer_channel.impl  # noqa: F401
+
     factory = _TRANSFER_CHANNEL_FACTORY_REGISTRY.get(transfer_channel_type)
     if factory is None:
         known = sorted(_TRANSFER_CHANNEL_FACTORY_REGISTRY)
