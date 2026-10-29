@@ -19,6 +19,10 @@ logger = init_logger(__name__)
 T = TypeVar("T")
 
 
+class RemoteRequestError(RuntimeError):
+    """The server completed an RPC with an explicit failure response."""
+
+
 class MessagingStream(Iterator[T]):
     """A cancellable response iterator with transport-provided blocking reads.
 

@@ -12,7 +12,7 @@ import time
 # First Party
 from lmcache.utils import init_logger
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
-from lmcache.v1.multiprocess.futures import MessagingFuture
+from lmcache.v1.multiprocess.futures import MessagingFuture, RemoteRequestError
 from lmcache.v1.multiprocess.token_codec import num_packed_tokens
 from lmcache.v1.multiprocess.transport.base import RequestClient
 
@@ -129,6 +129,7 @@ class LookupState:
 
         # Matched token count; None until final, then never changes.
         self._result: int | None = None
+        self._error: RemoteRequestError | None = None
 
         # Guards ``_servers`` and ``_result``; every send happens under it.
         self._lock = threading.Lock()
@@ -179,7 +180,8 @@ class LookupState:
     def on_lookup_finished(self, url: str, future: MessagingFuture[None]) -> None:
         """Handle a completed LOOKUP by querying that server's prefetch status.
 
-        A failed LOOKUP is logged and still followed by a QUERY_PREFETCH_STATUS.
+        An explicit remote failure is terminal; other failed LOOKUPs are
+        logged and still followed by a QUERY_PREFETCH_STATUS.
         Stale futures and calls after the result is final are ignored.
 
         Args:
@@ -205,7 +207,8 @@ class LookupState:
         """Handle a completed QUERY_PREFETCH_STATUS.
 
         An int reply resolves the server, and the last one resolves the
-        lookup. A None or failed reply is re-queried. Stale futures and calls
+        lookup. An explicit remote failure is terminal. A None or other failed
+        reply is re-queried. Stale futures and calls
         after the result is final are ignored.
 
         Args:
@@ -248,7 +251,7 @@ class LookupState:
             sent_queries = self._handle_completed_rpcs()
 
             for url, server in self._servers.items():
-                if server.phase is _Phase.NEEDS_REQUERY:
+                if self._result is None and server.phase is _Phase.NEEDS_REQUERY:
                     sent_queries.append(self._send_query_prefetch_status(url, server))
 
             queries_to_wait: list[tuple[_RpcFuture, float]] = []
@@ -287,8 +290,13 @@ class LookupState:
         Returns:
             None while the lookup is unresolved and open; otherwise the
             matched token count, which is 0 after a timeout or ``close``.
+
+        Raises:
+            RemoteRequestError: The server explicitly failed this lookup.
         """
         with self._lock:
+            if self._error is not None:
+                raise self._error
             return self._result
 
     def _handle_completed_rpcs(self) -> list[tuple[str, _QueryPrefetchStatusFuture]]:
@@ -314,6 +322,9 @@ class LookupState:
         self, url: str, server: _Server, future: _RpcFuture
     ) -> list[tuple[str, _QueryPrefetchStatusFuture]]:
         """Send QUERY_PREFETCH_STATUS after the LOOKUP; caller holds the lock."""
+        if isinstance(future.exception_, RemoteRequestError):
+            self._fail_remote_request(url, future.exception_)
+            return []
         if future.exception_ is not None:
             logger.warning(
                 "LOOKUP for request %s to %s failed: %s; querying its status anyway",
@@ -329,6 +340,9 @@ class LookupState:
     ) -> list[tuple[str, _QueryPrefetchStatusFuture]]:
         """Resolve the server or re-query it after a QUERY_PREFETCH_STATUS
         reply; caller holds the lock."""
+        if isinstance(future.exception_, RemoteRequestError):
+            self._fail_remote_request(url, future.exception_)
+            return []
         if future.exception_ is not None:
             logger.warning(
                 "QUERY_PREFETCH_STATUS for request %s to %s failed: %s; re-querying",
@@ -351,6 +365,15 @@ class LookupState:
         server.phase = _Phase.NEEDS_REQUERY
         server.future = None
         return []
+
+    def _fail_remote_request(self, url: str, error: RemoteRequestError) -> None:
+        """Stop this lookup without converting an explicit failure to a miss."""
+        self._error = RemoteRequestError(
+            f"Lookup {self._key.request_id} at {url} failed: {error}"
+        )
+        # Existing final-result guards stop callbacks and further queries. The
+        # public get_result checks _error first and never exposes this sentinel.
+        self._result = 0
 
     def _send_query_prefetch_status(
         self, url: str, server: _Server

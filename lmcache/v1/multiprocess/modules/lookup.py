@@ -697,6 +697,12 @@ class LookupModule(DiscoverableModule):
         result = self._ctx.storage_manager.query_prefetch_status(job.handle)
         if result is None:
             return None
+        if result.error is not None:
+            # The controller already released this failed request's resources.
+            # Consume the job exactly once before the RPC reports its failure.
+            with self._prefetch_job_lock:
+                self._prefetch_jobs.pop(job.request_id, None)
+            raise RuntimeError(f"Prefetch {job.request_id} failed: {result.error}")
         if job.row_windows:
             found_count, _retain = fold_unfold_grouped(
                 result.hit_cells, job.row_windows

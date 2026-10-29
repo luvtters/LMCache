@@ -990,7 +990,12 @@ class LMCacheMPSchedulerAdapter:
             None if the lookup request is not finished yet.
         """
         lookup = self._lookups.get(request_id)
-        if lookup is None or not self.is_healthy:
+        if lookup is None:
+            return 0
+        # Preserve an explicit failure even if a heartbeat independently marks
+        # a backing server unhealthy at the same time.
+        lookup.get_result()
+        if not self.is_healthy:
             # No job (unhealthy at submit time or already cleaned up), or a
             # server went down: give up on this lookup.
             return 0

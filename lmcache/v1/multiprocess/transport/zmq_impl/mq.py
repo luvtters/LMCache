@@ -28,6 +28,7 @@ from lmcache.v1.multiprocess.custom_types import (
 from lmcache.v1.multiprocess.futures import (
     MessagingFuture,
     MessagingStream,
+    RemoteRequestError,
 )
 from lmcache.v1.multiprocess.request_handler import HandlerType
 from lmcache.v1.multiprocess.rpc import RpcOperation, RpcSpec, get_rpc_spec
@@ -44,6 +45,7 @@ T = TypeVar("T")
 
 # Internal type used for the client-server communication
 RequestUID = int
+_ERROR_RESPONSE = b"lmcache-rpc-error-v1"
 
 
 # Helper functions
@@ -434,6 +436,11 @@ class MessageQueueClient:
                     )
                 )
                 return
+            if len(b_response) == 2 and b_response[0] == _ERROR_RESPONSE:
+                future.set_exception(
+                    RemoteRequestError(msgspec_decode(b_response[1], cls=str))
+                )
+                return
             if b_response:
                 response = msgspec_decode(b_response[0], cls=rpc_spec.response_type)
                 future.set_result(response)
@@ -736,10 +743,19 @@ class MessageQueueServer(RequestServer):
                 self.output_queue.put(frames_to_send)
                 self._output_efd.notify()
 
-            except Exception:
+            except Exception as exc:
                 logger.exception("Error in blocking handler")
+                self._queue_error_response(prefix_frames, exc)
 
         future.add_done_callback(_notify_response)
+
+    def _queue_error_response(self, prefix_frames: list[bytes], exc: Exception) -> None:
+        # Successful replies retain their existing wire format and return type.
+        self.output_queue.put(
+            prefix_frames
+            + [_ERROR_RESPONSE, msgspec_encode(f"{type(exc).__name__}: {exc}", cls=str)]
+        )
+        self._output_efd.notify()
 
     def _call_handler(
         self,
@@ -787,8 +803,9 @@ class MessageQueueServer(RequestServer):
                     payloads=payloads,
                     prefix_frames=[identity, b_request_uid, b_operation],
                 )
-            except Exception:
+            except Exception as exc:
                 logger.exception("Error handling operation %s", operation)
+                self._queue_error_response([identity, b_request_uid, b_operation], exc)
         else:
             logger.error("No handler registered for operation %s", operation)
             logger.error("Available handlers: %s", list(self.handlers.keys()))

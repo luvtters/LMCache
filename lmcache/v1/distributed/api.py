@@ -654,6 +654,8 @@ class PrefetchResult:
     they are not persisted. Tags name configured L1s for affinity and reporting
     and are the appropriate identity at process boundaries.
     """
+    error: str | None = None
+    """Terminal prefetch failure; empty hit cells are not a cache miss."""
     _l1_hit_count: int = field(init=False, repr=False, compare=False)
     _l2_hit_count: int = field(init=False, repr=False, compare=False)
 

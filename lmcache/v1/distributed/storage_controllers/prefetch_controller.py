@@ -917,13 +917,13 @@ class PrefetchController(StorageControllerInterface):
                 for request in list(self._in_flight_requests.values()):
                     try:
                         self._advance_request(request, signaled_adapters)
-                    except Exception:
+                    except Exception as exc:
                         logger.exception(
                             "Unexpected error advancing in-flight prefetch request "
                             "%d; aborting it",
                             request.request_id,
                         )
-                        self._abort_request(request)
+                        self._abort_request(request, exc)
 
             try:
                 self._start_pending_requests()
@@ -1055,11 +1055,11 @@ class PrefetchController(StorageControllerInterface):
             request_id, spec = self._pending_queue.popleft()
             try:
                 self._start_lookup_phase(request_id, spec)
-            except Exception:
+            except Exception as exc:
                 logger.exception("Failed starting prefetch request %d", request_id)
                 request = self._in_flight_requests.get(request_id)
                 if request is not None:
-                    self._abort_request(request)
+                    self._abort_request(request, exc)
 
     def _can_admit_new_prefetch(self, spec: PrefetchTaskSpec) -> bool:
         """Return whether the pending request ``spec`` may start now.
@@ -1695,9 +1695,11 @@ class PrefetchController(StorageControllerInterface):
             # Wake any WAIT_PREFETCH_STATUS handler blocked on this result.
             self._prefetch_results_cv.notify_all()
 
-    def _abort_request(self, request: InFlightPrefetchRequest) -> None:
+    def _abort_request(
+        self, request: InFlightPrefetchRequest, error: Exception
+    ) -> None:
         """Give up on a request after an error: return everything it holds,
-        report a miss for every cell, and drop it from the in-flight table."""
+        publish an explicit failure, and drop it from the in-flight table."""
         self._release_all_locks(request)
         empty = Bitmap2D.zeros(len(request.key_groups), len(request.key_groups[0].keys))
         self._publish_result(
@@ -1706,6 +1708,7 @@ class PrefetchController(StorageControllerInterface):
                 hit_cells=empty.to_list(),
                 l1_hit_cells=empty.zeros_like().to_list(),
                 l2_hit_cells=empty.zeros_like().to_list(),
+                error=f"{type(error).__name__}: {error}",
             ),
         )
         self._retire_request(request)
