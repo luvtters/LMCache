@@ -199,6 +199,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         # Route finish_write / finish_read_prefetched through a C++ host
         # callback so the driver thread doesn't acquire the GIL.
         self._device_host_func_dispatcher = DeviceHostFuncDispatcher()
+        self._device_callbacks_quiesced = False
         self._device_host_func_dispatcher.register(
             "finish_write",
             self._ctx.storage_manager.finish_write,
@@ -442,11 +443,15 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             "cache_context_meta": cache_context_meta,
         }
 
+    def quiesce_device_callbacks(self) -> None:
+        """Stop/drain callbacks while retaining entries and storage ownership."""
+        if not self._device_callbacks_quiesced:
+            self._device_host_func_dispatcher.stop()
+            self._device_callbacks_quiesced = True
+
     def close(self) -> None:
         """Release GPU resources owned by this module."""
-        # Stop the drain thread before storage_manager.close() so any
-        # in-flight completions reach a live storage manager.
-        self._device_host_func_dispatcher.stop()
+        self.quiesce_device_callbacks()
 
         with self._lock:
             entries = list(self._cache_contexts.values())
