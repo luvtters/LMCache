@@ -20,9 +20,6 @@ from lmcache.v1.distributed.transfer_channel.factory import (
     create_transfer_channel_context,
 )
 
-# Import the implementations so they self-register their factories.
-import lmcache.v1.distributed.transfer_channel.impl  # noqa: F401
-
 if TYPE_CHECKING:
     # First Party
     from lmcache.v1.distributed.internal_api import L1MemoryDesc

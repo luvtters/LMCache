@@ -93,6 +93,8 @@ class DeviceHostFuncDispatcher(PeriodicThread):
 
     def stop(self, timeout: float = 5.0) -> None:
         super().stop(timeout=timeout)
+        if self._thread is not None and self._thread.is_alive():
+            raise TimeoutError("Device callback dispatcher is still running")
         PeriodicThreadRegistry.get_instance().unregister(self.name)
         self._drain_once()
 

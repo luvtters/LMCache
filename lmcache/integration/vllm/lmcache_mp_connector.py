@@ -750,7 +750,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             # Banner from the scheduler role only, so tensor-parallel
             # deployments print it once rather than once per worker.
             print_banner_once(sys.stderr)
-            self.scheduler_adapter = LMCacheMPSchedulerAdapter(
+            self.scheduler_adapter = self.create_lmcache_mp_scheduler_adapter(
                 server_urls=server_urls,
                 context=zmq_context,
                 model_name=cache_model_name,
@@ -865,6 +865,22 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             "lmcache.mp.transfer_intermediate_tensors", False
         )
         return vllm_transfer
+
+    def create_lmcache_mp_scheduler_adapter(
+        self, **adapter_kwargs: Any
+    ) -> LMCacheMPSchedulerAdapter:
+        """Build the scheduler adapter, preserving the default implementation.
+
+        Subclasses may override this alongside the worker-adapter factory to
+        provide matching lookup and transfer semantics.
+
+        Args:
+            adapter_kwargs: Keyword arguments for ``LMCacheMPSchedulerAdapter``.
+
+        Returns:
+            The scheduler adapter used by this connector.
+        """
+        return LMCacheMPSchedulerAdapter(**adapter_kwargs)
 
     # ==============================
     # Worker-side methods
