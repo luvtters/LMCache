@@ -236,21 +236,31 @@ def _build_server_components(
     )
     known_modules = set(module_classes)
 
-    for module_cls in order_modules(
-        [cls for cls in module_classes if not cls.deferred], known_modules
-    ):
-        _build_module(module_cls, build_ctx)
+    try:
+        for module_cls in order_modules(
+            [cls for cls in module_classes if not cls.deferred], known_modules
+        ):
+            _build_module(module_cls, build_ctx)
 
-    for module_cls in order_modules(
-        [cls for cls in module_classes if cls.deferred], known_modules
-    ):
-        _build_module(module_cls, build_ctx)
+        for module_cls in order_modules(
+            [cls for cls in module_classes if cls.deferred], known_modules
+        ):
+            _build_module(module_cls, build_ctx)
 
-    built_types = build_ctx.built_types
-    modules = build_ctx.built
-    plugin_router = build_server_module_router(ctx, modules)
-    if plugin_router is not None:
-        modules.append(plugin_router)
+        built_types = build_ctx.built_types
+        modules = build_ctx.built
+        plugin_router = build_server_module_router(ctx, modules)
+        if plugin_router is not None:
+            modules.append(plugin_router)
+    except BaseException:
+        # A later factory may fail after earlier modules started background
+        # threads. Stop those modules before the caller closes native L1.
+        for module in reversed(build_ctx.built):
+            try:
+                module.close()
+            except Exception:
+                logger.exception("Partial engine module cleanup failed")
+        raise
 
     module_details = [
         "%s(dependencies=[%s])"
@@ -359,53 +369,84 @@ def run_cache_server(
     # stock hybrid clients.
     is_blend = mp_config.engine_type == "blend"
 
-    ctx = MPCacheServerContext(
-        storage_manager_config=storage_manager_config,
-        chunk_size=mp_config.chunk_size,
-        hash_algorithm=mp_config.hash_algorithm,
-        null_block_id=mp_config.null_block_id,
-        separate_object_groups=mp_config.separate_object_groups,
-        full_sw_kv=is_blend,
-        session_ttl_seconds=mp_config.session_ttl_seconds,
-    )
+    from lmcache.v1.multiprocess.l1_runtime import create_l1_runtime
 
-    components = _build_server_components(ctx, mp_config, coordinator_config)
-    engine = MPCacheServer(ctx, components.modules)
-
-    InitializeMPUsageContext(mp_config, storage_manager_config)
-    continuous_usage = InitializeMPContinuousUsage(event_bus, ctx.chunk_size)
-    if continuous_usage is not None:
-        ctx.add_chunk_size_bind_listener(continuous_usage.update_chunk_size)
-    if coordinator_config.url:
-
-        def bind_chunk_size_to_coordinator(chunk_size: int) -> None:
-            bind_coordinator_chunk_size(coordinator_config.url, chunk_size)
-
-        ctx.add_chunk_size_bind_listener(bind_chunk_size_to_coordinator)
-    InitializeL2ConnectorUsage(event_bus, ctx.storage_manager)
-    InitializeL1Usage(event_bus, ctx.storage_manager)
-
-    transport = mp_config.transport
-    server: RequestServer = create_request_server(
-        components.modules,
-        mp_config,
-    )
-
-    logger.info(
-        "LMCache %s cache server is running on %s:%d",
-        transport,
-        mp_config.host,
-        mp_config.port,
-    )
-
-    if not hasattr(torch_dev, "init"):
-        logger.warning(
-            "Backend '%s' does not support init(), skipping device init",
-            torch_device_type,
+    try:
+        l1_runtime = create_l1_runtime(
+            mp_config.runtime_plugin_config.extra_config, storage_manager_config
         )
-    else:
-        torch_dev.init()
-    server.start()
+        ctx = MPCacheServerContext(
+            storage_manager_config=storage_manager_config,
+            chunk_size=mp_config.chunk_size,
+            hash_algorithm=mp_config.hash_algorithm,
+            null_block_id=mp_config.null_block_id,
+            separate_object_groups=mp_config.separate_object_groups,
+            full_sw_kv=is_blend,
+            session_ttl_seconds=mp_config.session_ttl_seconds,
+            l1_runtime=l1_runtime,
+        )
+    except BaseException:
+        shutdown_gc_monitor()
+        raise
+
+    # Ownership transfers to the HTTP lifespan/caller only after startup
+    # succeeds. Before that point, a failed bind or module setup must not leave
+    # a newly allocated L1/BM arena alive. Normal close still refuses live I/O.
+    engine = None
+    server = None
+    try:
+        components = _build_server_components(ctx, mp_config, coordinator_config)
+        engine = MPCacheServer(ctx, components.modules)
+
+        InitializeMPUsageContext(mp_config, storage_manager_config)
+        continuous_usage = InitializeMPContinuousUsage(event_bus, ctx.chunk_size)
+        if continuous_usage is not None:
+            ctx.add_chunk_size_bind_listener(continuous_usage.update_chunk_size)
+        if coordinator_config.url:
+
+            def bind_chunk_size_to_coordinator(chunk_size: int) -> None:
+                bind_coordinator_chunk_size(coordinator_config.url, chunk_size)
+
+            ctx.add_chunk_size_bind_listener(bind_chunk_size_to_coordinator)
+        InitializeL2ConnectorUsage(event_bus, ctx.storage_manager)
+        InitializeL1Usage(event_bus, ctx.storage_manager)
+
+        transport = mp_config.transport
+        server: RequestServer = create_request_server(
+            components.modules,
+            mp_config,
+        )
+
+        logger.info(
+            "LMCache %s cache server is running on %s:%d",
+            transport,
+            mp_config.host,
+            mp_config.port,
+        )
+
+        if not hasattr(torch_dev, "init"):
+            logger.warning(
+                "Backend '%s' does not support init(), skipping device init",
+                torch_device_type,
+            )
+        else:
+            torch_dev.init()
+        server.start()
+    except BaseException:
+        if server is not None:
+            try:
+                server.close()
+            except Exception:
+                logger.exception("Request-server cleanup after startup failure failed")
+        try:
+            if engine is not None:
+                engine.close()
+            else:
+                ctx.close()
+        except Exception:
+            logger.exception("L1 runtime cleanup after startup failure failed")
+        shutdown_gc_monitor()
+        raise
 
     logger.info("LMCache cache server is running...")
 

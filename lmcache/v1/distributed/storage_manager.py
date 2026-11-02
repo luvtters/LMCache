@@ -5,6 +5,7 @@ Distributed multi-tier storage manager for MP mode
 
 # Standard
 from collections import defaultdict
+from collections.abc import Callable
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import replace
 from typing import Any, Iterator, Optional, cast
@@ -27,6 +28,7 @@ from lmcache.v1.distributed.api import (
 )
 from lmcache.v1.distributed.config import (
     EvictionConfig,
+    L1ManagerConfig,
     StorageManagerConfig,
     requires_single_l1_memory_region,
     unwrap_l2_adapter_config,
@@ -39,6 +41,7 @@ from lmcache.v1.distributed.internal_api import (
     L2AdapterListener,
 )
 from lmcache.v1.distributed.l1_manager import L1Manager
+from lmcache.v1.distributed.memory_manager import L1ManagerProtocol
 from lmcache.v1.distributed.l2_adapters import create_l2_adapter
 from lmcache.v1.distributed.l2_adapters.base import AdapterUsage, L2AdapterInterface
 from lmcache.v1.distributed.l2_adapters.config import (
@@ -106,6 +109,7 @@ class StorageManager:
         *,
         _l1_managers: tuple[L1ManagerInterface, ...] | None = None,
         _write_policy: OrderedWritePolicy | None = None,
+        memory_manager_factory: Callable[[L1ManagerConfig], L1ManagerProtocol] | None = None,
     ) -> None:
         """Create configured peer L1s and their affinity-bound L2 controllers.
 
@@ -115,12 +119,16 @@ class StorageManager:
                 Validated managers transfer lifecycle ownership to this instance.
             _write_policy: Candidate order, validated and captured once at startup.
                 Later policy mutations do not reconfigure the manager.
+            memory_manager_factory: Optional production L1 backing factory. Native
+                object management, placement, prefetch and eviction remain in core.
 
         Raises:
             ValueError: Manager identities/tags, placement, backing storage, or
                 affinity settings conflict.
         """
         with ExitStack() as cleanup:
+            if _l1_managers is not None and memory_manager_factory is not None:
+                raise ValueError("Choose existing L1 managers or a backing factory")
             if _l1_managers is not None:
                 if not _l1_managers or len(
                     {m.l1_manager_id for m in _l1_managers}
@@ -146,7 +154,18 @@ class StorageManager:
                         raise ValueError(
                             f"Device-DAX path already owned by an L1: {path}"
                         )
-                    manager: L1ManagerInterface = L1Manager(manager_config)
+                    backing = (
+                        memory_manager_factory(manager_config)
+                        if memory_manager_factory is not None else None
+                    )
+                    try:
+                        manager: L1ManagerInterface = L1Manager(
+                            manager_config, memory_manager=backing
+                        )
+                    except BaseException:
+                        if backing is not None:
+                            backing.close()
+                        raise
                     cleanup.callback(manager.close)
                     created.append(manager)
                 managers = tuple(created)

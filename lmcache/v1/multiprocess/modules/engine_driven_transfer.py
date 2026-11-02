@@ -62,6 +62,9 @@ class EngineDrivenContextEntry:
     world_size: int
     last_seen: float = 0.0
     has_liveness_signal: bool = False
+    # Retain external transfer ownership after removal from the live registry.
+    # A timeout/disconnect is not evidence that a remote DMA completed.
+    external_strategy: TransferStrategy | None = None
 
 
 class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
@@ -136,8 +139,14 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
     def close(self) -> None:
         """Release resources owned by this module."""
         with self._lock:
+            external = [
+                entry.external_strategy for entry in self._engine_driven_contexts.values()
+                if entry.external_strategy is not None
+            ]
             self._engine_driven_contexts.clear()
             self._strategies.clear()
+        for strategy in external:
+            strategy.release()
 
     def touch_instance(self, instance_id: int) -> None:
         """Refresh the worker's last-seen time and mark it ping-proven.
@@ -241,6 +250,12 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             instance_id: The popped instance ID.
             entry: The popped entry.
         """
+        if entry.external_strategy is not None:
+            # The external strategy owns its actual I/O reservations. Never
+            # publish unfinished writes through the SHM cleanup path.
+            entry.external_strategy.release()
+            self._ctx.layout_desc_registry.unregister(entry.model_name, entry.world_size)
+            return
         with self._pending_shm_lock:
             stale_writes = [k for k in self._pending_shm_writes if k[0] == instance_id]
             stale_reads = [k for k in self._pending_shm_reads if k[0] == instance_id]
@@ -309,6 +324,8 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         """
         shm_name = self._shm_pool_info["shm_name"]
         pool_size = self._shm_pool_info["pool_size"]
+        runtime = getattr(self._ctx, "l1_runtime", None)
+        transport_metadata = runtime.registration_metadata if runtime is not None else {}
 
         now = time.monotonic()
         with self._lock:
@@ -323,6 +340,7 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                     shm_name=shm_name,
                     pool_size=pool_size,
                     null_block_id=self._ctx.null_block_id,
+                    transport_metadata=transport_metadata,
                 )
 
         dtype = getattr(torch, payload.dtype_str, None)
@@ -415,7 +433,12 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             pending_reads=self._pending_shm_reads,
             pending_lock=self._pending_shm_lock,
             transfer_key_factory=self._make_transfer_key,
+        ) if runtime is None else runtime.create_transfer_strategy(
+            self._ctx.storage_manager, payload, metadata,
+            read_owner_resolver=self._ctx.get_read_owners,
         )
+        if runtime is not None:
+            entry.external_strategy = strategy
         with self._lock:
             self._engine_driven_contexts[payload.instance_id] = entry
             self._strategies[payload.instance_id] = strategy
@@ -463,6 +486,7 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             shm_name=shm_name,
             pool_size=pool_size,
             null_block_id=self._ctx.null_block_id,
+            transport_metadata=transport_metadata,
         )
 
     @request_handler(operation="unregister_kv_cache_engine_driven_context")

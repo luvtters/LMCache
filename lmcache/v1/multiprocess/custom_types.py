@@ -276,6 +276,9 @@ class RegisterEngineDrivenContextResponse:
     shm_name: str = ""
     pool_size: int = 0
     null_block_id: int = 0
+    # Control metadata only. External transports must be selected explicitly
+    # by both endpoints; no tensor payload or process-local pointers go here.
+    transport_metadata: dict = field(default_factory=dict)
 
 
 @dataclass

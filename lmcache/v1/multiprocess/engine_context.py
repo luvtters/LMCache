@@ -209,6 +209,7 @@ class MPCacheServerContext:
         full_sw_kv: bool = False,
         null_block_id: int = 0,
         session_ttl_seconds: float = SessionManager.DEFAULT_SESSION_TTL,
+        l1_runtime=None,
     ) -> None:
         self._configured_chunk_size = chunk_size
         self._chunk_size = chunk_size
@@ -223,10 +224,25 @@ class MPCacheServerContext:
         self._separate_object_groups = separate_object_groups
         self._full_sw_kv = full_sw_kv
 
-        self.shm_pool_info: ShmPoolInfo = self._compute_shm_pool_info(
-            storage_manager_config
+        self.l1_runtime = l1_runtime
+        self.shm_pool_info: ShmPoolInfo = (
+            {"shm_name": "", "pool_size": 0}
+            if l1_runtime is not None
+            else self._compute_shm_pool_info(storage_manager_config)
         )
-        self._storage_manager = StorageManager(storage_manager_config)
+        try:
+            self._storage_manager = StorageManager(
+                storage_manager_config,
+                memory_manager_factory=(
+                    l1_runtime.create_memory_manager if l1_runtime is not None else None
+                ),
+            )
+        except BaseException:
+            # StorageManager closes constructed arenas on initialization error;
+            # their external owner still needs its separate final teardown.
+            if l1_runtime is not None:
+                l1_runtime.close()
+            raise
         self._token_hasher = TokenHasher(
             chunk_size=chunk_size, hash_algorithm=hash_algorithm
         )
@@ -242,6 +258,10 @@ class MPCacheServerContext:
         """
         self._session_manager.close()
         self._storage_manager.close()
+        # No finally: if storage still has in-flight I/O it must retain its
+        # backing session, rather than unmapping memory under a worker.
+        if self.l1_runtime is not None:
+            self.l1_runtime.close()
 
     @property
     def chunk_size(self) -> int:

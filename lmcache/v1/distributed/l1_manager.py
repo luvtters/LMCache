@@ -228,6 +228,13 @@ class L1Manager(L1ManagerInterface):
         self._staging: dict[ObjectKey, dict[str, L1ObjectState]] = {}
         # Bytes held by staging objects (kept in sync with ``_staging``).
         self._staging_bytes: int = 0
+        # Actual-I/O pins are deliberately separate from native TTL locks.
+        # Tokens are single-use for this manager so a late completion can
+        # never release a later operation that reused the same token.
+        self._io_pins: dict[
+            object, dict[ObjectKey, tuple[str, str, L1ObjectState]]
+        ] = {}
+        self._used_io_tokens: set[object] = set()
 
         # GDS, Device-DAX, and CPU L1 are mutually exclusive tiers. Each tier
         # owns its backing allocator instead of branching inside the CPU path.
@@ -454,7 +461,11 @@ class L1Manager(L1ManagerInterface):
             # overhead (TTLLock is C++ std::atomic).
             for _ in range(total):
                 entry.read_lock.unlock()
-            if entry.is_temporary and not entry.read_lock.is_locked():
+            if (
+                entry.is_temporary
+                and not entry.read_lock.is_locked()
+                and not self._has_io_pin(entry)
+            ):
                 need_to_free.append(entry.memory_obj)
                 need_to_free_keys.append(key)
                 del self._objects[key]
@@ -523,6 +534,16 @@ class L1Manager(L1ManagerInterface):
             it is admitted. Different tags may stage the same key at the same
             time.
         """
+        return self._reserve_write_locked(keys, is_temporary, layout_desc, tag)
+
+    def _reserve_write_locked(
+        self,
+        keys: list[ObjectKey],
+        is_temporary: list[bool],
+        layout_desc: MemoryLayoutDesc,
+        tag: str,
+    ) -> dict[ObjectKey, L1OperationResult]:
+        """Reserve staging objects; caller holds ``self._lock``."""
         if len(keys) != len(is_temporary):
             raise ValueError(
                 f"L1Manager.reserve_write: {len(keys)} keys but "
@@ -540,6 +561,9 @@ class L1Manager(L1ManagerInterface):
 
             staged = self._get_staging(key, tag)
             if staged is not None:
+                if self._has_write_io_pin(key, tag, staged):
+                    ret[key] = (L1Error.KEY_NOT_WRITABLE, None)
+                    continue
                 if staged.write_lock.is_locked():
                     ret[key] = (L1Error.KEY_NOT_WRITABLE, None)
                     continue
@@ -605,6 +629,180 @@ class L1Manager(L1ManagerInterface):
         return ret
 
     @l1_mgr_synchronized
+    def reserve_write_io(
+        self,
+        keys: list[ObjectKey],
+        is_temporary: list[bool],
+        layout_desc: MemoryLayoutDesc,
+        token: object,
+        tag: str = "",
+    ) -> dict[ObjectKey, L1OperationResult]:
+        """Reserve staging buffers and pin them for actual I/O without TTL.
+
+        The token is single-use. Successful keys remain staged and protected
+        until :meth:`finish_write_io` completes the same token and tag.
+        """
+        if len(keys) != len(is_temporary):
+            raise ValueError(
+                f"L1Manager.reserve_write_io: {len(keys)} keys but "
+                f"{len(is_temporary)} is_temporary flags"
+            )
+        if not self._claim_io_token(token):
+            return {key: (L1Error.KEY_IN_WRONG_STATE, None) for key in keys}
+        ret = self._reserve_write_locked(keys, is_temporary, layout_desc, tag)
+        pins: dict[ObjectKey, tuple[str, str, L1ObjectState]] = {}
+        for key, (error, _) in ret.items():
+            if error == L1Error.SUCCESS:
+                staged = self._get_staging(key, tag)
+                if staged is not None:
+                    pins[key] = ("write", tag, staged)
+        if pins:
+            self._io_pins[token] = pins
+        return ret
+
+    @l1_mgr_synchronized
+    def finish_write_io(
+        self, keys: list[ObjectKey], token: object, tag: str = ""
+    ) -> dict[ObjectKey, L1Error]:
+        """Complete and admit only the exact staging objects pinned by token."""
+        ret: dict[ObjectKey, L1Error] = {}
+        notification_keys: list[ObjectKey] = []
+        notification_meta: list[L1ObjectMeta] = []
+        discarded: list[MemoryObj] = []
+        pins = self._io_pins.get(token)
+        for key in keys:
+            pin = pins.get(key) if pins is not None else None
+            staged = self._get_staging(key, tag)
+            if (
+                pin is None
+                or pin[0] != "write"
+                or pin[1] != tag
+                or staged is not pin[2]
+            ):
+                ret[key] = L1Error.KEY_IN_WRONG_STATE
+                continue
+            staged.write_lock.unlock()
+            self._pop_staging(key, tag)
+            del pins[key]
+            if key in self._objects:
+                discarded.append(staged.memory_obj)
+            else:
+                self._objects[key] = staged
+                if not staged.is_temporary:
+                    notification_keys.append(key)
+                    notification_meta.append(self._object_meta(staged.memory_obj))
+            ret[key] = L1Error.SUCCESS
+        if pins is not None and not pins:
+            del self._io_pins[token]
+        self._memory_manager.free(discarded)
+        if notification_keys:
+            for listener in self._registered_listeners:
+                listener.on_l1_keys_write_finished(notification_keys)
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.L1_WRITE_FINISHED,
+                    metadata={
+                        "l1_tag": self._config.tag,
+                        "keys": notification_keys,
+                        "meta": notification_meta,
+                    },
+                )
+            )
+        return ret
+
+    @l1_mgr_synchronized
+    def read_prefetched_io(
+        self, keys: list[ObjectKey], token: object
+    ) -> dict[ObjectKey, L1OperationResult]:
+        """Replace one live native read reservation per key with an I/O pin."""
+        if not self._claim_io_token(token):
+            return {key: (L1Error.KEY_IN_WRONG_STATE, None) for key in keys}
+        ret: dict[ObjectKey, L1OperationResult] = {}
+        pins: dict[ObjectKey, tuple[str, str, L1ObjectState]] = {}
+        for key in keys:
+            entry = self._objects.get(key)
+            if entry is None:
+                ret[key] = (L1Error.KEY_NOT_EXIST, None)
+            elif not entry.read_lock.is_locked():
+                ret[key] = (L1Error.KEY_IN_WRONG_STATE, None)
+            else:
+                # Consume exactly the prefetched reservation now. Completion
+                # later releases only this identity-bound pin, never a TTL lock.
+                entry.read_lock.unlock()
+                pins[key] = ("read", "", entry)
+                ret[key] = (L1Error.SUCCESS, entry.memory_obj)
+        if pins:
+            self._io_pins[token] = pins
+        return ret
+
+    @l1_mgr_synchronized
+    def finish_read_io(
+        self, keys: list[ObjectKey], token: object
+    ) -> dict[ObjectKey, L1Error]:
+        """Release only resident objects captured by this I/O token."""
+        ret: dict[ObjectKey, L1Error] = {}
+        pins = self._io_pins.get(token)
+        free_keys: list[ObjectKey] = []
+        free_objs: list[MemoryObj] = []
+        successful_keys: list[ObjectKey] = []
+        for key in keys:
+            pin = pins.get(key) if pins is not None else None
+            entry = self._objects.get(key)
+            if pin is None or pin[0] != "read" or entry is not pin[2]:
+                ret[key] = L1Error.KEY_IN_WRONG_STATE
+                continue
+            del pins[key]
+            ret[key] = L1Error.SUCCESS
+            successful_keys.append(key)
+            if (
+                entry.is_temporary
+                and not entry.read_lock.is_locked()
+                and not self._has_io_pin(entry)
+            ):
+                del self._objects[key]
+                free_keys.append(key)
+                free_objs.append(entry.memory_obj)
+        if pins is not None and not pins:
+            del self._io_pins[token]
+        for listener in self._registered_listeners:
+            listener.on_l1_keys_read_finished(successful_keys)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L1_READ_FINISHED,
+                metadata={"l1_tag": self._config.tag, "keys": successful_keys},
+            )
+        )
+        if free_objs:
+            self._free_and_report_deleted(free_keys, free_objs)
+        return ret
+
+    def _claim_io_token(self, token: object) -> bool:
+        """Claim a hashable, single-use operation token under ``self._lock``."""
+        try:
+            if token in self._used_io_tokens:
+                return False
+            self._used_io_tokens.add(token)
+        except TypeError as exc:
+            raise TypeError("I/O token must be hashable") from exc
+        return True
+
+    def _has_io_pin(self, entry: L1ObjectState) -> bool:
+        return any(
+            pinned_entry is entry
+            for pins in list(self._io_pins.values())
+            for _, _, pinned_entry in list(pins.values())
+        )
+
+    def _has_write_io_pin(
+        self, key: ObjectKey, tag: str, entry: L1ObjectState
+    ) -> bool:
+        return any(
+            pin[0] == "write" and pin[1] == tag and pin[2] is entry
+            for pins in list(self._io_pins.values())
+            if (pin := pins.get(key)) is not None
+        )
+
+    @l1_mgr_synchronized
     def finish_write(
         self,
         keys: list[ObjectKey],
@@ -643,6 +841,10 @@ class L1Manager(L1ManagerInterface):
         discarded: list[MemoryObj] = []
 
         for key in keys:
+            staged = self._get_staging(key, tag)
+            if staged is not None and self._has_write_io_pin(key, tag, staged):
+                ret[key] = L1Error.KEY_IN_WRONG_STATE
+                continue
             err, entry = self._take_staging(key, tag, "finish write")
             ret[key] = err
             if err != L1Error.SUCCESS or entry is None:
@@ -723,6 +925,10 @@ class L1Manager(L1ManagerInterface):
         discarded: list[MemoryObj] = []
 
         for key in keys:
+            staged = self._get_staging(key, tag)
+            if staged is not None and self._has_write_io_pin(key, tag, staged):
+                ret[key] = (L1Error.KEY_IN_WRONG_STATE, None)
+                continue
             err, entry = self._take_staging(key, tag, "finish_write_and_reserve_read")
             if err != L1Error.SUCCESS or entry is None:
                 ret[key] = (err, None)
@@ -800,6 +1006,10 @@ class L1Manager(L1ManagerInterface):
                 ret[key] = L1Error.KEY_NOT_EXIST
                 continue
 
+            if entry is not None and self._has_io_pin(entry):
+                ret[key] = L1Error.KEY_IS_LOCKED
+                continue
+
             self._reclaim_staging(key, force)
             if key in self._staging:
                 # A live reservation still pins the key.
@@ -857,6 +1067,10 @@ class L1Manager(L1ManagerInterface):
         gone_keys: list[ObjectKey] = []
 
         for key in keys:
+            staged = self._get_staging(key, tag)
+            if staged is not None and self._has_write_io_pin(key, tag, staged):
+                ret[key] = L1Error.KEY_IN_WRONG_STATE
+                continue
             err, entry = self._take_staging(key, tag, "finish_write_and_delete")
             ret[key] = err
             if err != L1Error.SUCCESS or entry is None:
@@ -905,17 +1119,21 @@ class L1Manager(L1ManagerInterface):
         if force:
             staging_count = sum(len(per_tag) for per_tag in self._staging.values())
             logger.warning(
-                "L1Manager: force-clearing all %d objects and %d staging objects "
-                "(including locked ones). This may corrupt in-flight "
-                "store/prefetch operations — use with caution.",
+                "L1Manager: force-clearing %d objects and %d staging objects "
+                "(except actual-I/O-pinned objects). This may corrupt other "
+                "in-flight store/prefetch operations — use with caution.",
                 len(self._objects),
                 staging_count,
             )
-            all_keys = list(self._objects.keys())
-            all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
+            all_keys = [
+                key for key, entry in self._objects.items()
+                if not self._has_io_pin(entry)
+            ]
+            all_memory_objs = [self._objects[key].memory_obj for key in all_keys]
             all_meta = [self._object_meta(obj) for obj in all_memory_objs]
             self._memory_manager.free(all_memory_objs)
-            self._objects.clear()
+            for key in all_keys:
+                del self._objects[key]
             for listener in self._registered_listeners:
                 listener.on_l1_keys_deleted_by_manager(all_keys)
             self._event_bus.publish(
@@ -934,9 +1152,12 @@ class L1Manager(L1ManagerInterface):
                 self._reclaim_staging(key, force=True)
             self._report_staging_gone(staging_keys)
             logger.info(
-                "L1Manager: cleared %d objects and %d staging objects, 0 remaining.",
+                "L1Manager: cleared %d objects and %d staging objects; "
+                "%d objects and %d staging objects remain.",
                 len(all_keys),
                 staging_count,
+                len(self._objects),
+                sum(len(per_tag) for per_tag in self._staging.values()),
             )
             return
 
@@ -945,7 +1166,7 @@ class L1Manager(L1ManagerInterface):
         locked_count = 0
 
         for key, entry in list(self._objects.items()):
-            if entry.read_lock.is_locked():
+            if entry.read_lock.is_locked() or self._has_io_pin(entry):
                 locked_count += 1
                 continue
             keys_to_clear.append(key)
@@ -991,14 +1212,20 @@ class L1Manager(L1ManagerInterface):
             or a staging object whose write lock expired; False otherwise.
         """
         entry = self._objects.get(key, None)
-        if entry is not None and not entry.read_lock.is_locked():
+        if (
+            entry is not None
+            and not entry.read_lock.is_locked()
+            and not self._has_io_pin(entry)
+        ):
             return True
         per_tag = self._staging.get(key, None)
         if per_tag is None:
             return False
         # Snapshot: this runs without the manager lock.
         return any(
-            not staged.write_lock.is_locked() for staged in list(per_tag.values())
+            not staged.write_lock.is_locked()
+            and not self._has_write_io_pin(key, tag, staged)
+            for tag, staged in list(per_tag.items())
         )
 
     def get_memory_usage(self) -> tuple[int, int]:
@@ -1198,9 +1425,16 @@ class L1Manager(L1ManagerInterface):
 
     def close(self) -> None:
         """Close the L1Manager and free all resources."""
+        with self._lock:
+            if self._io_pins:
+                raise RuntimeError("Cannot close L1Manager with active I/O pins")
         if not self._external_memory_manager:
             close_l1_gds_context(self._l1_manager_id)
         with self._lock:
+            # Recheck under the lock that also protects freeing: a reader may
+            # have converted its TTL reservation into an I/O pin meanwhile.
+            if self._io_pins:
+                raise RuntimeError("Cannot close L1Manager with active I/O pins")
             if self._external_memory_manager and (
                 self._staging
                 or any(entry.read_lock.is_locked() for entry in self._objects.values())
@@ -1255,6 +1489,8 @@ class L1Manager(L1ManagerInterface):
             "total_object_count": len(self._objects) + staging,
             "write_locked_count": write_locked,
             "read_locked_count": read_locked,
+            "io_operation_count": len(self._io_pins),
+            "io_object_reference_count": sum(len(pins) for pins in self._io_pins.values()),
             "temporary_count": temporary,
             "staging_object_count": staging,
             "staging_bytes": self._staging_bytes,
@@ -1383,6 +1619,8 @@ class L1Manager(L1ManagerInterface):
             return 0
         freed: list[MemoryObj] = []
         for tag, staged in list(per_tag.items()):
+            if self._has_write_io_pin(key, tag, staged):
+                continue
             if staged.write_lock.is_locked():
                 if not force:
                     continue

@@ -1062,20 +1062,47 @@ class EngineDrivenTransferContext(TransferContext):
             use_mla=use_mla_flag,
             group_layouts=[state.layout_desc for state in group_states] or None,
         )
-        self._engine_driven_context = create_engine_driven_context(
-            metadata,
-            self._req_client,
-            mq_timeout,
-            shm_name=shm_name,
-            pool_size=pool_size,
+        self._engine_driven_context = self._create_engine_driven_context(
+            metadata, response, mq_timeout
         )
-        supported_transfer_mode = "SHM" if shm_name and pool_size > 0 else "inline"
+        transport_metadata = getattr(response, "transport_metadata", {})
+        supported_transfer_mode = (
+            transport_metadata.get("transport")
+            if isinstance(transport_metadata, dict) and transport_metadata
+            else ("SHM" if shm_name and pool_size > 0 else "inline")
+        )
         logger.info(
             "Worker engine-driven context registered "
             "(instance_id=%d, mode=%s, groups=%d)",
             self._instance_id,
             supported_transfer_mode,
             max(1, len(self._group_states)),
+        )
+
+    def _create_engine_driven_context(
+        self,
+        metadata: EngineDrivenContextMetadata,
+        response: RegisterEngineDrivenContextResponse | Any,
+        mq_timeout: float,
+    ) -> EngineDrivenContext:
+        """Create the engine-driven data context for a registration response.
+
+        Subclasses may select a negotiated transport using response metadata.
+        The default preserves the SHM/inline behavior, including its existing
+        inline fallback when SHM cannot be attached.
+        """
+        transport_metadata = getattr(response, "transport_metadata", {})
+        if transport_metadata:
+            raise RuntimeError(
+                "Server negotiated an engine-driven transport unsupported by "
+                f"{type(self).__name__}: {transport_metadata!r}"
+            )
+        return create_engine_driven_context(
+            metadata,
+            self._req_client,
+            mq_timeout,
+            shm_name=getattr(response, "shm_name", ""),
+            pool_size=getattr(response, "pool_size", 0),
         )
 
     def unregister(self) -> MessagingFuture[Any] | None:

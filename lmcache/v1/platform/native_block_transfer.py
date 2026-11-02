@@ -94,7 +94,8 @@ def transfer_with_address_kernel(
     Args:
         kernel: The compiled ``multi_layer_block_kv_transfer``.
         paged_kv: Normalized paged KV tensors on ``device``.
-        chunks: Host chunk tensors, filled in place for ``D2H``.
+        chunks: Host chunks for the ordinary path, or contiguous tensors on
+            ``device`` for an accelerator-to-accelerator staging path.
         block_ids: Paged-block IDs in chunk order.
         device: Device that owns the paged KV tensors.
         direction: ``D2H`` or ``H2D``.
@@ -106,7 +107,21 @@ def transfer_with_address_kernel(
     """
     device = torch.device(device)
     is_d2h = int(direction) == int(lmcache_native.TransferDirection.D2H)
-    unpinned = not all(chunk.is_pinned() for chunk in chunks)
+    chunk_devices = {chunk.device for chunk in chunks}
+    if len(chunk_devices) > 1:
+        raise ValueError("Native block-transfer chunks must all use one device")
+    chunk_device = next(iter(chunk_devices), torch.device("cpu"))
+    device_chunks = chunk_device == device and device.type != "cpu"
+    if device_chunks:
+        if any(not chunk.is_contiguous() for chunk in chunks):
+            raise ValueError("Accelerator block-transfer chunks must be contiguous")
+        unpinned = False
+    else:
+        if chunk_device.type != "cpu":
+            raise ValueError(
+                f"Block-transfer chunks on {chunk_device} must be on CPU or match {device}"
+            )
+        unpinned = not all(chunk.is_pinned() for chunk in chunks)
     kernel_chunks = chunks
     if unpinned and is_d2h:
         # Pinning would replace the caller's tensors and break the in-place

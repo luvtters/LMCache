@@ -114,6 +114,7 @@ def _expected_chunk(paged: DiscoverableKVCache, blocks: list[int]) -> torch.Tens
 def _host_chunk(address: int, pinned: bool = True) -> MagicMock:
     """Host chunk stand-in; real pinning needs an accelerator."""
     chunk = MagicMock(spec=torch.Tensor)
+    chunk.device = CPU
     chunk.is_pinned.return_value = pinned
     chunk.data_ptr.return_value = address
     return chunk
@@ -245,6 +246,63 @@ def test_unpinned_h2d_chunks_sync_after_launch(
 
     assert [launch.chunks for launch in kernel.launches] == [[0x2000]]
     assert syncs == [1], "expected exactly one sync, after the launch"
+
+
+def test_same_device_scratch_skips_host_pinning_and_staging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Accelerator scratch is passed by pointer without CPU staging."""
+    kernel = _RecordingKernel()
+    syncs: list[torch.device] = []
+    monkeypatch.setattr(native_block_transfer, "synchronize_device", syncs.append)
+    monkeypatch.setattr(
+        torch.Tensor,
+        "is_pinned",
+        lambda _self: pytest.fail("device scratch must not be queried as host memory"),
+    )
+    monkeypatch.setattr(
+        torch,
+        "empty_like",
+        lambda *_args, **_kwargs: pytest.fail("device scratch must not be staged"),
+    )
+    paged, fmt, desc = _paged_kv(num_blocks=2)
+    device = torch.device("meta")
+    scratch = torch.empty((_CHUNK_TOKENS,), device=device)
+
+    transfer_with_address_kernel(
+        kernel,
+        paged,
+        [scratch],
+        [0, 1],
+        device,
+        D2H,
+        desc,
+        _CHUNK_TOKENS,
+        fmt,
+        0,
+    )
+
+    assert [launch.chunks for launch in kernel.launches] == [[scratch.data_ptr()]]
+    assert syncs == []
+
+
+def test_scratch_on_a_different_accelerator_is_rejected() -> None:
+    paged, fmt, desc = _paged_kv(num_blocks=2)
+    scratch = torch.empty((_CHUNK_TOKENS,), device="meta")
+
+    with pytest.raises(ValueError, match="must be on CPU or match"):
+        transfer_with_address_kernel(
+            _RecordingKernel(),
+            paged,
+            [scratch],
+            [0, 1],
+            torch.device("cpu"),
+            D2H,
+            desc,
+            _CHUNK_TOKENS,
+            fmt,
+            0,
+        )
 
 
 # -- CUDA: the compiled kernel ---------------------------------------------
