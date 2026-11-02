@@ -10,6 +10,7 @@ import torch
 
 # First Party
 from lmcache.v1.distributed.config import L1MemoryManagerConfig
+from lmcache.v1.distributed.internal_api import L1MemoryDesc
 from lmcache.v1.distributed.memory_manager import L1MemoryManager
 from lmcache.v1.memory_allocators.lazy_memory_allocator import LazyMemoryAllocator
 from lmcache.v1.memory_allocators.mixed_memory_allocator import MixedMemoryAllocator
@@ -74,6 +75,7 @@ def test_anonymous_mixed_allocator_exposes_full_stable_range() -> None:
 
         assert desc.size == _FINAL_SIZE
         assert desc.stable_registration_size == _FINAL_SIZE
+        assert desc.stable_host_registration_size == _FINAL_SIZE
     finally:
         manager.close()
 
@@ -85,6 +87,7 @@ def test_shm_mixed_allocator_exposes_no_stable_range() -> None:
 
         assert desc.size == _FINAL_SIZE
         assert desc.stable_registration_size is None
+        assert desc.stable_host_registration_size == _FINAL_SIZE
     finally:
         manager.close()
 
@@ -107,5 +110,13 @@ def test_lazy_allocator_exposes_bounded_heap_snapshot(
 
         assert desc.size == _FINAL_SIZE
         assert desc.stable_registration_size == expected_stable_size
+        assert desc.stable_host_registration_size == expected_stable_size
     finally:
         manager.close()
+
+
+def test_l1_memory_desc_legacy_constructor_defaults_host_range_to_none() -> None:
+    desc = L1MemoryDesc(ptr=0x1000, size=_FINAL_SIZE, align_bytes=_ALIGN)
+
+    assert desc.stable_registration_size is None
+    assert desc.stable_host_registration_size is None

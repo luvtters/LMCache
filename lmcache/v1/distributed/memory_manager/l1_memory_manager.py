@@ -213,6 +213,7 @@ class L1MemoryManager:
         """
         if isinstance(self._allocator, MixedMemoryAllocator):
             buffer = self._allocator.buffer
+            stable_host_registration_size = self._size_in_bytes
             # POSIX SHM is file-backed and is not eligible for io_uring
             # fixed-buffer registration, so expose no stable prefix for it.
             stable_registration_size = (
@@ -231,6 +232,7 @@ class L1MemoryManager:
             )
             if stable_registration_size <= 0:
                 stable_registration_size = None
+            stable_host_registration_size = stable_registration_size
         else:
             raise NotImplementedError(
                 "get_l1_memory_desc is not implemented for this allocator type."
@@ -240,6 +242,7 @@ class L1MemoryManager:
             size=self._size_in_bytes,
             align_bytes=self._align_bytes,
             stable_registration_size=stable_registration_size,
+            stable_host_registration_size=stable_host_registration_size,
         )
 
     def close(self) -> None:

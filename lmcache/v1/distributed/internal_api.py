@@ -42,12 +42,18 @@ class L1MemoryDesc:
             allocator, this is a snapshot of the currently pinned prefix and
             does not change as the allocator grows. ``None`` means that no
             stable size is exposed.
+        stable_host_registration_size: Stable mapped host-buffer prefix owned
+            by L1 until manager close, including POSIX SHM. This describes
+            lifetime and bounds only; each transport must establish whether
+            it can register that backing. It does not change io_uring's
+            file-backed registration restrictions above.
     """
 
     ptr: int
     size: int
     align_bytes: int
     stable_registration_size: int | None = None
+    stable_host_registration_size: int | None = None
 
 
 @dataclass(frozen=True)
