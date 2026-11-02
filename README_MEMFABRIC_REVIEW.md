@@ -1,26 +1,28 @@
-# worker 直传的 LMCache core 配套修改
+# MemFabric worker 路线的原生 L1 core 配套
 
-**独立分支设备复验：NOT_VERIFIED。** 以下设备记录只属于原运行快照；源码提取和本次 CPU 通过不能替代独立分支上机复验。
+配套 Ascend 为 `LMCache-Ascend` 的同名目标分支。当前提供原生 L1 manager 的显式 memory manager 注入入口；MemFabric HOST 映射与搬运实现在 Ascend 仓库。默认未注入时沿用原生分配路径。显式注入的外部 arena 仍有写暂存或活跃读保护时拒绝关闭，避免关闭过程先释放正在使用的对象。
 
-配套 Ascend：luvtters/LMCache-Ascend 的 `review/memfabric-worker-direct`。L2 兼容路线不需要本分支的扩展。
+**当前仅验收 native L1 管理与 BM 真实数据搬运基础 gate；完整 vLLM connector、模型推理、P/D 和性能尚未完成。** L2 兼容路线不依赖本分支。
 
-基线是官方 `6913259264dbebb2fa5ba1665606c40ffc5c6661`；全部十个实现、测试、说明文件原样提取自已使用的 `5b565d211416cd48bebf20bae12a4abc15a72ba9`，没有加入后续 L1 allocator/批量注册候选。
+## 固定源码与保留范围
 
-## 差异
+- 官方基线：`6913259264dbebb2fa5ba1665606c40ffc5c6661`。
+- 本目标起点：core `26e0d7e01f95d81edcc3c8b7d77c89399c851a23`，配套 Ascend `13ad6e39e6a1b300dc310a7219d1d6bcfae97430`，同时应用本目标两仓库差异。
+- 开发分支：`work/memfabric-l1-compat-20261102`；长期检视分支：`review/memfabric-worker-direct`。是否完成提交及同步，以实际 tip 和本轮记录为准。
+- 旧 Direct 专用 scheduler adapter 工厂和 lookup state hook 已恢复官方实现，其专用文档与测试同时移除。
+- 保留通用 transfer channel 按需导入及 native callback 关闭修复；未随旧 Direct 删除。
+- 旧 worker 直传只归档于本地 tag `archive/memfabric-worker-direct-pre-l1-20261102`，不与新原生 L1 并行维护两套对象管理。
 
-- Connector 新增可覆写 scheduler adapter 工厂，默认仍用原 adapter。
-- scheduler 把 lookup state 构造提取为 hook，让直传的查询和锁保护使用同一个池目录。
-- transfer_channel 改为实际创建时才加载可选 native 后端，避免仅导入 RPC 类型就加载无关 SDK。
-- 回调关闭增加存活检查和幂等 quiesce，未知完成不提前释放上下文。
+## 验证
 
-本分支没有 MemFabric SDK、池索引或搬运实现；这些位于配套 Ascend 分支。它不是整体重写 LMCache L1，也不表示 worker 已完成 L1 兼容。
+2026-11-02，M8 对同名独立目标分支及本轮源码差异完成 native L1 CPU gate（退出码 0）和 18 MiB 真实 NPU→BM HOST 原生 L1→NPU gate（pool、worker 均退出码 0）。这些不是完整模型或 P/D 验收。随后清理旧 Direct 和专用 hooks，已验证的 core 注入、BM、L1 backing 与 gate 方法体保持不变；清理后的定向 CPU 回归由本轮记录单列。
 
-## 验证边界
-
-该运行基线曾用于 Qwen3-8B worker 直传 TP1/TP2/TP4 真实功能检查；原运行仍有退出异常，不能称生命周期已全部通过。本次仅重新运行定向 CPU 检查，不重新上机。
+直接复用配套 Ascend 的 CPU 入口，无需另建测试框架或复制实现：
 
 ```sh
-python tests/v1/test_mp_adapter_extension_hooks.py
-python tests/v1/distributed/transfer_channel/test_lazy_import.py
-python tests/v1/multiprocess/check_memfabric_callback_shutdown_cpu.py
+python /absolute/path/to/worker-ascend/examples/memfabric/validate_l1_backing_cpu.py \
+  --core-source /absolute/path/to/worker-core \
+  --ascend-source /absolute/path/to/worker-ascend
 ```
+
+该入口使用真实 `L1Manager` / `StorageManager` / `TensorMemoryAllocator` 与 native TTLLock，覆盖注入 arena、写完成前不可读、读写 reservation 下关闭被拒绝、native L1 预取与读保护、释放后的 GVA 拒绝及零占用。只有 BM arena 由 CPU tensor 模拟；不初始化 SDK 或 NPU，不能替代设备验证。

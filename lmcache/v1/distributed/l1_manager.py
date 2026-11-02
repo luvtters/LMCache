@@ -203,8 +203,21 @@ class L1Manager(L1ManagerInterface):
         weakref.WeakValueDictionary()
     )
 
-    def __init__(self, config: L1ManagerConfig):
+    def __init__(
+        self, config: L1ManagerConfig, *, memory_manager: L1ManagerProtocol | None = None
+    ):
+        """Create native object management over an optional owned memory arena.
+
+        An injected manager transfers ownership to this L1Manager. It must
+        expose the configured DRAM capacity and remain valid through close().
+        GDS and Device-DAX retain their dedicated construction paths.
+        """
+        if memory_manager is not None and (
+            config.gds_l1_config is not None or config.memory_config.devdax_path
+        ):
+            raise ValueError("An injected L1 arena requires a DRAM configuration")
         self._config = config
+        self._external_memory_manager = memory_manager is not None
         self._l1_manager_id = next_l1_manager_id()
         self._lock = threading.Lock()
 
@@ -219,7 +232,9 @@ class L1Manager(L1ManagerInterface):
         # GDS, Device-DAX, and CPU L1 are mutually exclusive tiers. Each tier
         # owns its backing allocator instead of branching inside the CPU path.
         self._memory_manager: L1ManagerProtocol
-        if config.gds_l1_config is not None:
+        if memory_manager is not None:
+            self._memory_manager = memory_manager
+        elif config.gds_l1_config is not None:
             if config.memory_config.devdax_path:
                 raise ValueError("GDS and Device-DAX require separate L1 managers")
             self._memory_manager = GDSL1MemoryManager(config.gds_l1_config)
@@ -1183,8 +1198,16 @@ class L1Manager(L1ManagerInterface):
 
     def close(self) -> None:
         """Close the L1Manager and free all resources."""
-        close_l1_gds_context(self._l1_manager_id)
+        if not self._external_memory_manager:
+            close_l1_gds_context(self._l1_manager_id)
         with self._lock:
+            if self._external_memory_manager and (
+                self._staging
+                or any(entry.read_lock.is_locked() for entry in self._objects.values())
+            ):
+                raise RuntimeError("Cannot close an external L1 arena with active reservations")
+            if self._external_memory_manager:
+                close_l1_gds_context(self._l1_manager_id)
             all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
             for per_tag in self._staging.values():
                 all_memory_objs.extend(staged.memory_obj for staged in per_tag.values())
