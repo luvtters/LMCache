@@ -559,6 +559,16 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     # appends. The scheduler role sets it from the vLLM config.
     _mamba_relocation_window: int = 0
 
+    def set_xfer_handshake_metadata_pp_aware(
+        self, metadata: dict[tuple[int, int], Any]
+    ) -> None:
+        """Ignore peer PD handshake metadata for this local-cache connector.
+
+        Mooncake owns P-to-D transfer; MP cache registration uses its own IPC.
+        MultiConnector must still forward the full metadata to Mooncake.
+        """
+        return None
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -1696,6 +1706,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         for new_request in scheduler_output.scheduled_new_reqs:
             request_tracker = self._get_request_tracker(new_request.req_id)
+
+            # MultiConnector may pass empty blocks to a non-selected loader,
+            # but a writer still needs the scheduler's allocated block ids.
+            if not request_tracker.allocated_block_ids and new_request.block_ids:
+                request_tracker.append_block_ids(
+                    new_request.block_ids, self._mamba_relocation_window
+                )
 
             num_new_tokens = scheduler_output.num_scheduled_tokens[new_request.req_id]
             request_tracker.increase_num_scheduled_tokens(num_new_tokens)
