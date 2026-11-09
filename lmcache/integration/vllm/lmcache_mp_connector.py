@@ -3,6 +3,7 @@
 # Standard
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit, urlunsplit
 import math
 import sys
 import time
@@ -84,6 +85,7 @@ from lmcache.integration.vllm.utils import (
 )
 from lmcache.utils import CacheRemoveEvent
 from lmcache.utils import init_logger as lmcache_init_logger
+from lmcache.v1.multiprocess.pp_layout import PPStageLocator
 
 try:
     # First Party
@@ -532,6 +534,77 @@ def _ensure_transport_scheme(server_url: str) -> str:
     return f"tcp://{server_url}"
 
 
+def normalize_pp_server_urls(server_urls: list[str]) -> list[str]:
+    """Normalize endpoints and reject duplicate addresses for PP stages.
+
+    Args:
+        server_urls: Configured endpoints with explicit transport schemes.
+
+    Returns:
+        Canonical endpoint strings, preserving their stage order.
+
+    Raises:
+        ValueError: An endpoint is malformed or repeated.
+    """
+    normalized: list[str] = []
+    for url in server_urls:
+        parts = urlsplit(url)
+        host = parts.hostname
+        port = parts.port
+        if not host or port is None or parts.username or parts.password:
+            raise ValueError(f"Native PP requires a host:port endpoint: {url}")
+        host = host.lower()
+        if ":" in host:
+            host = f"[{host}]"
+        normalized.append(
+            urlunsplit(
+                (
+                    parts.scheme.lower(),
+                    f"{host}:{port}",
+                    parts.path.rstrip("/"),
+                    parts.query,
+                    parts.fragment,
+                )
+            )
+        )
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("Native PP cache endpoints must be distinct")
+    return normalized
+
+
+def build_pp_stage_locators(
+    vllm_config: "VllmConfig", model_name: str
+) -> tuple[PPStageLocator, ...]:
+    """Use vLLM's own layer partition helper for every logical PP stage.
+
+    Args:
+        vllm_config: Engine configuration with the complete model and topology.
+        model_name: Existing internal model identity, before PP decoration.
+
+    Returns:
+        Logical stage locators in pipeline order.
+    """
+    # Third Party
+    from vllm.distributed.utils import get_pp_indices
+
+    pc = vllm_config.parallel_config
+    total_layers = vllm_config.model_config.get_total_num_hidden_layers()
+    ranges = tuple(
+        get_pp_indices(total_layers, stage, pc.pipeline_parallel_size)
+        for stage in range(pc.pipeline_parallel_size)
+    )
+    return tuple(
+        PPStageLocator(
+            base_model_name=model_name,
+            tp_size=pc.tensor_parallel_size,
+            pp_size=pc.pipeline_parallel_size,
+            pp_rank=stage,
+            layer_ranges=ranges,
+        )
+        for stage in range(pc.pipeline_parallel_size)
+    )
+
+
 class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     """
     The connector for LMCache multi-process mode.
@@ -562,11 +635,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     def build_parallel_strategy(
         self, vllm_config: "VllmConfig", n_servers: int
     ) -> ParallelStrategy:
-        """Resolve cache geometry, retaining default multi-server PP rejection.
-
-        Device plugins may override this hook when they implement a supported
-        server-local PP layout. They must supply matching writer, reader and
-        piece identities to both scheduler and worker adapters.
+        """Select TP sharding, single-server, or one complete PP stage per server.
 
         Args:
             vllm_config: Serving engine configuration.
@@ -576,16 +645,29 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             Geometry used by the scheduler and workers.
 
         Raises:
-            ValueError: The default strategy cannot serve multi-server PP.
+            ValueError: Multi-server PP is not one complete stage per server,
+                or its DP/context-parallel/world geometry is unsupported.
         """
-        pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        pc = vllm_config.parallel_config
+        pp_size = pc.pipeline_parallel_size
+        strategy = build_parallel_strategy_from_vllm_config(vllm_config, n_servers)
         if n_servers > 1 and pp_size > 1:
-            raise ValueError(
-                "LMCacheMPConnector multi-server mode only supports "
-                "tensor parallelism (TP), not pipeline parallelism (PP). "
-                f"Got pp_size={pp_size}."
-            )
-        return build_parallel_strategy_from_vllm_config(vllm_config, n_servers)
+            if n_servers != pp_size:
+                raise ValueError(
+                    "Multi-server PP requires one server per complete PP stage"
+                )
+            if (
+                getattr(pc, "data_parallel_size", 1) != 1
+                or getattr(pc, "decode_context_parallel_size", 1) != 1
+                or getattr(pc, "prefill_context_parallel_size", 1) != 1
+            ):
+                raise ValueError("Native PP currently requires DP=DCP=PCP=1")
+            if pc.world_size != pc.tensor_parallel_size * pp_size:
+                raise ValueError("Native PP requires world_size == TP * PP")
+            if not 0 <= pc.rank < pc.world_size:
+                raise ValueError("Native PP worker rank is outside the engine world")
+            strategy.pp_stage_local = True
+        return strategy
 
     def __init__(
         self,
@@ -716,6 +798,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             )
 
         parallel_strategy = self.build_parallel_strategy(vllm_config, n_servers)
+        pp_stage_locators: tuple[PPStageLocator, ...] = ()
+        if parallel_strategy.pp_stage_local:
+            server_urls = normalize_pp_server_urls(server_urls)
+            pp_stage_locators = build_pp_stage_locators(vllm_config, cache_model_name)
         zmq_context = zmq.Context.instance()
 
         self.dispatcher = None
@@ -747,6 +833,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 vllm_block_size=scheduler_block_size,
                 parallel_strategy=parallel_strategy,
                 extra_config=vllm_config.kv_transfer_config.kv_connector_extra_config,
+                pp_stage_locators=pp_stage_locators,
             )
             self.request_trackers: dict[str, LMCacheMPRequestTracker] = {}
             # Worker events aggregated per step, awaiting take_events().
@@ -780,6 +867,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 parallel_strategy=parallel_strategy,
                 extra_config=vllm_config.kv_transfer_config.kv_connector_extra_config,
                 enable_kv_events=self._enable_kv_events,
+                pp_stage_locator=(
+                    pp_stage_locators[
+                        parallel_strategy.vllm_worker_id // parallel_strategy.tp_size
+                    ]
+                    if pp_stage_locators
+                    else None
+                ),
             )
             if self.transfer_intermediate_tensors:
                 # First Party
@@ -840,6 +934,19 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     @property
     def role(self) -> KVConnectorRole:
         return self._role
+
+    def set_xfer_handshake_metadata_pp_aware(
+        self, metadata: dict[int, dict[int, Any]]
+    ) -> None:
+        """Accept peer PP metadata without consuming another connector's payload.
+
+        LMCache MP is a local cache: its stage validation uses its own register
+        and status RPCs. MultiConnector may broadcast Mooncake's metadata here.
+
+        Args:
+            metadata: Peer connector metadata, intentionally left untouched.
+        """
+        return
 
     @property
     def transfer_intermediate_tensors(self) -> bool:

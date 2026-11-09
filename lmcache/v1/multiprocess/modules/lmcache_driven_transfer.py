@@ -4,8 +4,10 @@
 # Standard
 from dataclasses import dataclass
 from typing import Any, Sequence
+import json
 import threading
 import time
+import uuid
 
 # First Party
 from lmcache import torch_dev
@@ -39,6 +41,13 @@ from lmcache.v1.multiprocess.object_group_transfer import (
     downsample_and_stage_block_ids,
     transfer_kv_per_object_group,
 )
+from lmcache.v1.multiprocess.pp_layout import (
+    PPRegistrationAck,
+    PPRegistrationInfo,
+    PPStageLocator,
+    PPStageProfile,
+    PPStageStatus,
+)
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
@@ -50,6 +59,56 @@ from lmcache.v1.platform.cache_context import create_cache_context
 import lmcache.lmcache_native as lmcache_native
 
 logger = init_logger(__name__)
+
+
+def get_pp_layout_json(cache_context: BaseCacheContext, chunk_size: int) -> str:
+    """Describe actual group geometry without pointers or pool capacity.
+
+    Args:
+        cache_context: Constructed platform context, after layout detection.
+        chunk_size: Server's logical tokens per cached object.
+
+    Returns:
+        Canonical JSON preserving physical layer and group order. Pool block
+        counts and strides between blocks are excluded: they describe the
+        backing allocation rather than the stored per-chunk content.
+    """
+    manager = cache_context.kv_layer_groups_manager
+    kernels = []
+    for index, group in enumerate(manager.kernel_groups):
+        shape, dtype = cache_context.get_kernel_group_shape_dtype(chunk_size, index)
+        kernels.append(
+            {
+                "layer_indices": list(group.layer_indices),
+                "shape": [int(dimension) for dimension in shape],
+                "dtype": str(dtype),
+                "engine_kv_format": str(group.engine_kv_format),
+                "engine_group_idx": group.engine_group_idx,
+                "tokens_per_block": group.tokens_per_block,
+                "block_size": int(group.shape_desc.bs),
+                "sw_size_tokens": group.sw_size_tokens,
+                "recurrent_state": group.recurrent_state,
+            }
+        )
+    objects = [
+        {
+            "kernel_group_indices": list(group.kernel_group_indices),
+            "sw_size_chunks": group.sw_size_chunks,
+            "aux": group.aux,
+            "recurrent": group.recurrent,
+        }
+        for group in manager.object_groups
+    ]
+    return json.dumps(
+        {
+            "chunk_size": chunk_size,
+            "kernel_groups": kernels,
+            "object_groups": objects,
+            "windows": list(manager.get_attn_desc().num_chunks_in_sw),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def get_layout_desc(
@@ -151,6 +210,8 @@ class ContextEntry:
             PING. Selects the reap window (timeout vs registration grace).
             Latched only by PING, never by traffic.
         event_backend: Cached event backend selected for this context's device.
+        registration_info: PP binding identity, absent for legacy registrations.
+        pp_profile: Server-derived PP content layout, absent for legacy entries.
     """
 
     cache_context: BaseCacheContext
@@ -159,6 +220,8 @@ class ContextEntry:
     last_seen: float = 0.0
     has_liveness_signal: bool = False
     event_backend: EventIPCBackend | None = None
+    registration_info: PPRegistrationInfo | None = None
+    pp_profile: PPStageProfile | None = None
 
 
 class LMCacheDrivenTransferModule(InstanceLivenessTarget):
@@ -178,8 +241,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         # off the MQ main loop, so register/unregister/store/retrieve and
         # report_status all serialize through this lock. Held only for dict
         # ops -- never across context creation, layout-registry calls, or
-        # empty_cache (leaf-lock invariant: no thread holds two locks).
+        # empty_cache (leaf-lock invariant: no external work while held).
         self._lock = threading.Lock()
+        # Serializes PP validation/publication with lifecycle removals. The
+        # leaf dictionary lock is never held during context or registry work.
+        self._registration_lock = threading.RLock()
+        self._server_instance_id = str(uuid.uuid4())
 
         # Route finish_write / finish_read_prefetched through a C++ host
         # callback so the driver thread doesn't acquire the GIL.
@@ -347,37 +414,38 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         Returns:
             The instance IDs reaped this scan.
         """
-        now = time.monotonic()
-        reaped: list[tuple[int, ContextEntry]] = []
-        with self._lock:
-            stale_ids = [
-                iid
-                for iid, entry in self._cache_contexts.items()
-                if now - entry.last_seen
-                > (
-                    reap_timeout_s
-                    if entry.has_liveness_signal
-                    else registration_grace_s
+        with self._registration_lock:
+            now = time.monotonic()
+            reaped: list[tuple[int, ContextEntry]] = []
+            with self._lock:
+                stale_ids = [
+                    iid
+                    for iid, entry in self._cache_contexts.items()
+                    if now - entry.last_seen
+                    > (
+                        reap_timeout_s
+                        if entry.has_liveness_signal
+                        else registration_grace_s
+                    )
+                ]
+                for iid in stale_ids:
+                    reaped.append((iid, self._cache_contexts.pop(iid)))
+            reaped_ids: list[int] = []
+            entries: list[ContextEntry] = []
+            for iid, e in reaped:
+                logger.warning(
+                    "Reaped GPU instance %d: silent for %.1fs (pinged=%s)",
+                    iid,
+                    now - e.last_seen,
+                    e.has_liveness_signal,
                 )
-            ]
-            for iid in stale_ids:
-                reaped.append((iid, self._cache_contexts.pop(iid)))
-        reaped_ids: list[int] = []
-        entries: list[ContextEntry] = []
-        for iid, e in reaped:
-            logger.warning(
-                "Reaped GPU instance %d: silent for %.1fs (pinged=%s)",
-                iid,
-                now - e.last_seen,
-                e.has_liveness_signal,
-            )
-            reaped_ids.append(iid)
-            entries.append(e)
-        if reaped:
-            del e  # a bound name would pin the final entry (see _release_entries)
-            reaped.clear()
-            self._release_entries(entries)
-        return reaped_ids
+                reaped_ids.append(iid)
+                entries.append(e)
+            if reaped:
+                del e  # a bound name would pin the final entry (see _release_entries)
+                reaped.clear()
+                self._release_entries(entries)
+            return reaped_ids
 
     def _release_entries(self, entries: list[ContextEntry]) -> None:
         """Release a batch of entries and reclaim their device memory.
@@ -433,10 +501,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         # in-flight completions reach a live storage manager.
         self._device_host_func_dispatcher.stop()
 
-        with self._lock:
-            entries = list(self._cache_contexts.values())
-            self._cache_contexts.clear()
-        self._release_entries(entries)
+        with self._registration_lock:
+            with self._lock:
+                entries = list(self._cache_contexts.values())
+                self._cache_contexts.clear()
+            self._release_entries(entries)
 
     @request_handler()
     def register_kv_cache(
@@ -472,6 +541,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         with self._lock:
             existing = self._cache_contexts.get(instance_id)
             if existing is not None:
+                if existing.registration_info is not None:
+                    raise ValueError("PP instance cannot use legacy registration")
                 existing.last_seen = now
                 logger.info(
                     "Instance %d already registered; refreshing liveness",
@@ -530,28 +601,184 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         )
 
     @request_handler()
+    def register_pp_kv_cache(
+        self,
+        instance_id: int,
+        kv_caches: KVCache,
+        model_name: str,
+        world_size: int,
+        engine_type: EngineType,
+        layout_hints: LayoutHints,
+        engine_group_infos: list[EngineGroupInfo],
+        registration_info: PPRegistrationInfo,
+    ) -> PPRegistrationAck:
+        """Register one PP worker and return its authoritative content identity.
+
+        Args:
+            instance_id: Worker instance ID, shared with heartbeat/unregister.
+            kv_caches: Platform IPC wrappers for this stage's actual KV tensors.
+            model_name: Base model name, matching the registration locator.
+            world_size: Stage-local KV piece count (one for MLA, TP otherwise).
+            engine_type: Engine used for platform layout detection.
+            layout_hints: Engine layout detection hints.
+            engine_group_infos: Ordered engine KV group metadata.
+            registration_info: Stage topology and stable binding token.
+
+        Returns:
+            This worker's ACK immediately, without waiting for other TP ranks.
+
+        Raises:
+            ValueError: If identity, topology, TP slot or actual layout conflicts.
+            RuntimeError: If platform context/event initialization fails.
+        """
+        info = registration_info
+        if model_name != info.locator.base_model_name:
+            raise ValueError("PP base model does not match locator")
+        expected_world = 1 if info.mla_only else info.locator.tp_size
+        if world_size != expected_world:
+            raise ValueError("PP world_size must be the stage-local KV piece count")
+        cache_context = create_cache_context(
+            kv_caches,
+            self._ctx.chunk_size,
+            layout_hints=layout_hints or None,
+            engine_group_infos=engine_group_infos,
+            engine_type=engine_type,
+            separate_object_groups=self._ctx.separate_object_groups,
+            full_sw_kv=self._ctx.full_sw_kv,
+            registration_info=info,
+        )
+        registered = False
+        published = False
+        namespace = ""
+        try:
+            profile = PPStageProfile(
+                info.locator,
+                info.layer_names,
+                info.mla_only,
+                get_pp_layout_json(cache_context, self._ctx.chunk_size),
+            )
+            if cache_context.num_layers != len(info.layer_names):
+                raise ValueError("Actual KV layer count does not match PP registration")
+            namespace = profile.cache_namespace
+            backend = get_event_ipc_backend(cache_context.device)
+            backend.check_event_support(cache_context.device)
+            manager = cache_context.kv_layer_groups_manager
+            layouts = {
+                gid: get_layout_desc(cache_context, self._ctx.chunk_size, gid)
+                for gid in range(manager.num_object_groups)
+            }
+            with self._registration_lock:
+                with self._lock:
+                    existing = self._cache_contexts.get(instance_id)
+                    peers = list(self._cache_contexts.items())
+                if existing is not None:
+                    if (
+                        existing.registration_info != info
+                        or existing.pp_profile != profile
+                    ):
+                        raise ValueError("Conflicting registration for active instance")
+                    with self._lock:
+                        existing.last_seen = time.monotonic()
+                    return PPRegistrationAck(
+                        profile, self._server_instance_id, instance_id, info.tp_rank
+                    )
+                for _, peer in peers:
+                    peer_info = peer.registration_info
+                    if peer_info is None:
+                        continue
+                    # A server endpoint owns one stage of a model at a time;
+                    # changed topology must not evade an occupied stage slot.
+                    if (
+                        peer_info.locator.base_model_name == model_name
+                        and peer_info.locator.pp_rank == info.locator.pp_rank
+                    ):
+                        if (
+                            peer_info.locator != info.locator
+                            or peer.pp_profile != profile
+                        ):
+                            raise ValueError("Active PP stage has incompatible profile")
+                        if peer_info.tp_rank == info.tp_rank:
+                            raise ValueError(
+                                "PP TP slot already has an active instance"
+                            )
+                ack = PPRegistrationAck(
+                    profile, self._server_instance_id, instance_id, info.tp_rank
+                )
+                try:
+                    self._ctx.layout_desc_registry.register(
+                        namespace,
+                        world_size,
+                        layouts[0],
+                        manager.get_attn_desc(),
+                        group_layout_descs=layouts,
+                    )
+                    registered = True
+                    with self._lock:
+                        self._cache_contexts[instance_id] = ContextEntry(
+                            cache_context,
+                            namespace,
+                            world_size,
+                            last_seen=time.monotonic(),
+                            event_backend=backend,
+                            registration_info=info,
+                            pp_profile=profile,
+                        )
+                    published = True
+                finally:
+                    if registered and not published:
+                        self._ctx.layout_desc_registry.unregister(namespace, world_size)
+                return ack
+        finally:
+            if not published:
+                cache_context.close()
+
+    @request_handler()
+    def get_pp_stage_status(self, locator: PPStageLocator) -> PPStageStatus:
+        """Snapshot active registrations; readiness requires every TP slot.
+
+        Args:
+            locator: Exact expected logical stage identity.
+
+        Returns:
+            A versioned status, with no profile and no ranks when absent.
+            An incompatible active topology also remains unready.
+        """
+        with self._registration_lock:
+            entries = self.context_entries_snapshot().values()
+            matching = [
+                entry
+                for entry in entries
+                if entry.registration_info is not None
+                and entry.registration_info.locator == locator
+            ]
+            ranks = tuple(sorted(entry.registration_info.tp_rank for entry in matching))
+            profile = matching[0].pp_profile if matching else None
+            return PPStageStatus(locator, self._server_instance_id, profile, ranks)
+
+    @request_handler()
     def unregister_kv_cache(self, instance_id: int) -> None:
         """Unregister the KV cache tensors for a given GPU instance ID.
 
         Args:
             instance_id: The GPU instance ID (such as PID).
         """
-        with self._lock:
-            popped = [
-                e
-                for e in (self._cache_contexts.pop(instance_id, None),)
-                if e is not None
-            ]
-        if not popped:
-            logger.warning(
-                "No registered GPU context found for instance ID %d", instance_id
-            )
-            return
+        with self._registration_lock:
+            with self._lock:
+                popped = [
+                    e
+                    for e in (self._cache_contexts.pop(instance_id, None),)
+                    if e is not None
+                ]
+            if not popped:
+                logger.warning(
+                    "No registered GPU context found for instance ID %d", instance_id
+                )
+                return
 
-        # No scalar binding: `popped` must stay the only reference so
-        # _release_entries' reclaim actually unmaps the IPC segments.
-        self._release_entries(popped)
-        logger.info("Unregistered KV cache for GPU ID %d", instance_id)
+            # No scalar binding: `popped` must stay the only reference so
+            # _release_entries' reclaim actually unmaps the IPC segments.
+            self._release_entries(popped)
+            logger.info("Unregistered KV cache for GPU ID %d", instance_id)
 
     @request_handler(
         HandlerType.BLOCKING,

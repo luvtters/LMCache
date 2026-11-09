@@ -57,6 +57,24 @@ orchestrators), use the HTTP server entry point:
         /opt/venv/bin/lmcache server \
         --l1-size-gb 60 --eviction-policy LRU --max-workers 4 --port 6555
 
+Complete pipeline stage per server
+----------------------------------
+
+Keep the public ``LMCacheMPConnector`` entry point and supply an ordered
+``lmcache.mp.server_urls`` list. When PP is greater than one and the server
+count equals PP, URL zero owns PP stage zero, URL one owns stage one, and so on.
+Each server must access the complete KV cache of its stage. This layout supports
+DP=DCP=PCP=1 and ``lmcache_driven`` transfer. Start servers separately and disable
+``lmcache.mp.autostart`` for multiple endpoints.
+
+No additional PP switch is required. The connector validates all TP workers'
+registrations before lookup, automatically isolates stage/partition/layout cache
+identities, and requires different server processes for different stages. The
+first version permits one active engine per stage registration space. Client and
+server must both support the new PP registration RPCs; incomplete registration
+or an incompatible version fails initialization. Single-server and PP=1 layouts
+retain their existing registration protocol.
+
 Isolated IPC (running without ``--ipc host``)
 ---------------------------------------------
 

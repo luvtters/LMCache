@@ -48,8 +48,16 @@ from lmcache.v1.multiprocess.group_view import (
     EngineGroupInfo,
     expand_engine_block_ids,
 )
+from lmcache.v1.multiprocess.pp_layout import (
+    PPRegistrationAck,
+    PPRegistrationInfo,
+    PPStageLocator,
+    PPStageProfile,
+    PPStageStatus,
+)
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 from lmcache.v1.multiprocess.transfer_context import (
+    LMCacheDrivenTransferContext,
     TransferContext,
     create_transfer_context,
 )
@@ -388,10 +396,15 @@ class ParallelStrategy:
     """Decode-context-parallel size: each chunk's KV is split into
     ``dcp_size`` token shards instead of one replicated copy."""
 
+    pp_stage_local: bool = False
+    """One complete PP stage per server; selected by the native connector."""
+
     @property
     def kv_world_size(self) -> int:
         """Number of pieces a single token chunk's KV cache is split into
         on the LMCache server storage."""
+        if self.pp_stage_local:
+            return 1 if self.mla_only else self.tp_size
         if self.mla_only:
             # MLA replicates KV across TP; distinct bytes exist only per
             # pipeline stage and per DCP token shard.
@@ -404,6 +417,8 @@ class ParallelStrategy:
         """Index of the piece of a single token chunk's KV cache
         that the current worker is responsible for,
         in ``[0, kv_world_size)``."""
+        if self.pp_stage_local:
+            return 0 if self.mla_only else self.vllm_worker_id % self.tp_size
         if self.mla_only:
             # Row-major over (pipeline stage, token shard).
             pp_stage = self.vllm_worker_id // self.tp_size
@@ -431,6 +446,8 @@ class ParallelStrategy:
     @property
     def kv_tp_size(self) -> int:
         """Tensor-parallel size as seen from a single LMCache server."""
+        if self.pp_stage_local:
+            return self.tp_size
         return self.tp_size // self.n_servers
 
     @property
@@ -446,6 +463,8 @@ class ParallelStrategy:
     @property
     def is_kv_writer(self) -> bool:
         """Whether this rank is responsible for storing KV."""
+        if self.pp_stage_local:
+            return not self.mla_only or self.vllm_worker_id % self.tp_size == 0
         if not self.mla_only:
             return True
         if self.dcp_size > 1:
@@ -680,6 +699,7 @@ class LMCacheMPSchedulerAdapter:
         mq_timeout: float = DEFAULT_MQ_TIMEOUT,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
         extra_config: dict[str, Any] | None = None,
+        pp_stage_locators: Sequence[PPStageLocator] = (),
     ):
         """
         Args:
@@ -700,6 +720,7 @@ class LMCacheMPSchedulerAdapter:
             extra_config: Optional dict with keys starting with
                 ``lmcache.mp.`` (e.g., ``lmcache.mp.mq_timeout``). When
                 provided, it overrides ``mq_timeout`` / ``heartbeat_interval``.
+            pp_stage_locators: Ordered stage identities for the native PP layout.
         """
         (
             vllm_block_size,
@@ -754,6 +775,16 @@ class LMCacheMPSchedulerAdapter:
 
         self.model_name = model_name
         self.parallel_strategy = parallel_strategy
+        # This map never changes during the scheduler lifetime: every lookup,
+        # cancellation and tail release therefore keeps the same namespace.
+        self._server_model_names = dict.fromkeys(self._server_urls, model_name)
+        if parallel_strategy.pp_stage_local:
+            try:
+                self._initialize_pp_stage_profiles(pp_stage_locators)
+            except Exception:
+                for client in self.req_clients.values():
+                    client.close()
+                raise
 
         # Read chunk size from lmcache
         chunk_sizes: dict[str, int] = {}
@@ -808,6 +839,49 @@ class LMCacheMPSchedulerAdapter:
         # Events must be reported by all world_size workers before considered complete.
         self._expected_worker_count = parallel_strategy.vllm_world_size
         self._store_request_pending_counts: dict[str, int] = {}
+
+    def _initialize_pp_stage_profiles(self, locators: Sequence[PPStageLocator]) -> None:
+        """Resolve complete worker registrations with one shared timeout budget.
+
+        Args:
+            locators: Expected logical stages in endpoint order.
+
+        Raises:
+            ValueError: A stage is incomplete, incompatible or aliases a server.
+            TimeoutError: Registration status exceeds the configured MQ budget.
+        """
+        if len(locators) != len(self._server_urls):
+            raise ValueError("PP stage locator count must match the server count")
+        deadline = time.monotonic() + self._mq_timeout
+        futures = {
+            url: self.req_clients[url].get_pp_stage_status(locator)
+            for url, locator in zip(self._server_urls, locators, strict=True)
+        }
+        server_ids: set[str] = set()
+        profiles: dict[str, PPStageProfile] = {}
+        for url, locator in zip(self._server_urls, locators, strict=True):
+            status = futures[url].result(timeout=max(0.0, deadline - time.monotonic()))
+            if not isinstance(status, PPStageStatus):
+                raise ValueError(f"PP server {url} returned an incompatible status")
+            if status.locator != locator or not status.ready or status.profile is None:
+                raise ValueError(
+                    f"PP server {url} has incomplete or mismatched registration"
+                )
+            profile = status.profile
+            if (
+                profile.mla_only != self.parallel_strategy.mla_only
+                or profile.kv_world_size != self.world_size
+                or profile.num_kv_readers != self.parallel_strategy.num_kv_readers
+            ):
+                raise ValueError(f"PP server {url} has incompatible cache geometry")
+            if status.server_instance_id in server_ids:
+                raise ValueError("PP stage URLs alias the same LMCache server process")
+            server_ids.add(status.server_instance_id)
+            profiles[url] = profile
+        self._server_model_names = {
+            url: profile.cache_namespace for url, profile in profiles.items()
+        }
+        logger.info("Native PP cache stages ready: %s", self._server_model_names)
 
     @property
     def world_size(self) -> int:
@@ -893,17 +967,19 @@ class LMCacheMPSchedulerAdapter:
             lookup_tokens // self.lmcache_tokens_per_chunk
         ) * self.lmcache_tokens_per_chunk
 
-        key = self._create_key(
-            token_ids,
-            start=0,
-            end=aligned_end,
-            request_id=request_id,
-            cache_salt=cache_salt,
-            request_configs=request_configs,
-        ).no_worker_id_version()
-
         futures: dict[str, MessagingFuture[None]] = {
-            url: self.req_clients[url].lookup(key, self.tp_size)
+            url: self.req_clients[url].lookup(
+                self._create_key(
+                    token_ids,
+                    start=0,
+                    end=aligned_end,
+                    request_id=request_id,
+                    cache_salt=cache_salt,
+                    request_configs=request_configs,
+                    server_url=url,
+                ).no_worker_id_version(),
+                self.tp_size,
+            )
             for url in self._server_urls
         }
 
@@ -951,6 +1027,7 @@ class LMCacheMPSchedulerAdapter:
                     request_id=request_id,
                     cache_salt=cs or "",
                     request_configs=request_configs,
+                    server_url=url,
                 ).no_worker_id_version()
                 self.req_clients[url].free_lookup_locks(tail_key, self.tp_size)
 
@@ -1172,15 +1249,16 @@ class LMCacheMPSchedulerAdapter:
             return
 
         # Free [start, end) on every server.
-        base_key = self._create_key(
-            token_ids,
-            start=start,
-            end=end,
-            request_id=request_id,
-            cache_salt=cache_salt,
-            request_configs=request_configs,
-        ).no_worker_id_version()
         for url in self._server_urls:
+            base_key = self._create_key(
+                token_ids,
+                start=start,
+                end=end,
+                request_id=request_id,
+                cache_salt=cache_salt,
+                request_configs=request_configs,
+                server_url=url,
+            ).no_worker_id_version()
             self.req_clients[url].free_lookup_locks(base_key, self.tp_size)
 
     def end_session(self, request_id: str) -> None:
@@ -1240,7 +1318,7 @@ class LMCacheMPSchedulerAdapter:
 
         for url in self._server_urls:
             self.req_clients[url].report_block_allocation(
-                os.getpid(), self.model_name, records
+                os.getpid(), self._server_model_names[url], records
             )
 
     # Helper functions
@@ -1252,6 +1330,7 @@ class LMCacheMPSchedulerAdapter:
         request_id: str,
         cache_salt: str = "",
         request_configs: dict[str, Any] | None = None,
+        server_url: str | None = None,
     ) -> IPCCacheServerKey:
         """Convert token IDs to an IPC cache engine key.
 
@@ -1263,6 +1342,7 @@ class LMCacheMPSchedulerAdapter:
             cache_salt: Per-user isolation salt.
             request_configs: Optional LMCache request configs to include in
                 the IPC key.
+            server_url: Target endpoint, required for stage-local PP keys.
 
         Returns:
             IPCCacheServerKey: The constructed key.
@@ -1271,7 +1351,11 @@ class LMCacheMPSchedulerAdapter:
         # so we set it to None in the key.
         return IPCCacheServerKey(
             num_kv_readers=self.parallel_strategy.num_kv_readers,
-            model_name=self.model_name,
+            model_name=(
+                self._server_model_names[server_url]
+                if server_url is not None
+                else self.model_name
+            ),
             world_size=self.world_size,
             worker_id=None,
             token_ids=tuple(token_ids),
@@ -1325,6 +1409,7 @@ class LMCacheMPWorkerAdapter:
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
         extra_config: dict[str, Any] | None = None,
         enable_kv_events: bool = False,
+        pp_stage_locator: PPStageLocator | None = None,
     ):
         """Initialize the worker adapter for current or legacy vLLM callers.
 
@@ -1347,6 +1432,7 @@ class LMCacheMPWorkerAdapter:
                 provided, it overrides ``mq_timeout`` / ``heartbeat_interval``.
             enable_kv_events: Whether to collect completed store operations
                 for vLLM's KV event publisher.
+            pp_stage_locator: Logical identity of this worker's complete stage.
 
         Raises:
             TypeError: If the connector argument shape is unsupported.
@@ -1412,6 +1498,12 @@ class LMCacheMPWorkerAdapter:
         # than os.getpid() to avoid collision in containerized deployments.
         # Masked to 63 bits to stay signed-int64-safe for any msgpack peer.
         self.instance_id: int = uuid.uuid4().int & ((1 << 63) - 1)
+        # Recovery creates a fresh TransferContext but must retain this binding.
+        self._pp_stage_locator = pp_stage_locator
+        self._pp_registration_token = uuid.uuid4().hex
+        self._pp_registration_info: PPRegistrationInfo | None = None
+        self._pp_profile: PPStageProfile | None = None
+        self._pp_base_model_name = model_name
         logger.info(
             "LMCache MP worker adapter created with instance_id=%d",
             self.instance_id,
@@ -1612,6 +1704,22 @@ class LMCacheMPWorkerAdapter:
                 not align with that group's paged-chunk boundaries).
         """
         logger.info("Registering kv caches")
+        if self.parallel_strategy.pp_stage_local:
+            if self._pp_stage_locator is None:
+                raise ValueError("Native PP registration requires a stage locator")
+            if self._pp_registration_info is not None:
+                raise ValueError(
+                    "PP KV rebinding requires unregistering the old adapter"
+                )
+            self._pp_registration_info = PPRegistrationInfo(
+                locator=self._pp_stage_locator,
+                global_rank=self.parallel_strategy.vllm_worker_id,
+                tp_rank=self.parallel_strategy.vllm_worker_id
+                % self.parallel_strategy.tp_size,
+                layer_names=tuple(kv_caches),
+                registration_token=self._pp_registration_token,
+                mla_only=self.parallel_strategy.mla_only,
+            )
         for info in engine_group_infos:
             if (
                 info.tokens_per_block > 0
@@ -1662,16 +1770,50 @@ class LMCacheMPWorkerAdapter:
             # Register on the local, not self.transfer_ctx: a concurrent
             # shutdown() may null self.transfer_ctx between publish and this
             # call. The local is always non-None.
-            transfer_ctx.register(
-                kv_caches,
-                self.model_name,
-                self.world_size,
-                self.blocks_in_chunk,
-                self._mq_timeout,
-                layout_hints=layout_hints,
-                engine_group_infos=self.engine_group_infos,
-                engine_type=EngineType.VLLM,
-            )
+            if self.parallel_strategy.pp_stage_local:
+                if not isinstance(transfer_ctx, LMCacheDrivenTransferContext):
+                    raise ValueError(
+                        "Native PP currently requires lmcache_driven transfer mode"
+                    )
+                info = self._pp_registration_info
+                if info is None:
+                    raise ValueError("PP registration metadata is not initialized")
+                ack = transfer_ctx.register_pp(
+                    kv_caches,
+                    self._pp_base_model_name,
+                    self.world_size,
+                    self._mq_timeout,
+                    info,
+                    layout_hints=layout_hints,
+                    engine_group_infos=self.engine_group_infos,
+                    engine_type=EngineType.VLLM,
+                )
+                if (
+                    not isinstance(ack, PPRegistrationAck)
+                    or ack.instance_id != self.instance_id
+                    or ack.tp_rank != info.tp_rank
+                    or ack.profile.locator != info.locator
+                    or ack.profile.layer_names != info.layer_names
+                    or ack.profile.mla_only != info.mla_only
+                ):
+                    raise ValueError(
+                        "PP server returned an incompatible registration ACK"
+                    )
+                if self._pp_profile is not None and ack.profile != self._pp_profile:
+                    raise ValueError("PP recovery changed the registered cache layout")
+                self._pp_profile = ack.profile
+                self.model_name = ack.cache_namespace
+            else:
+                transfer_ctx.register(
+                    kv_caches,
+                    self.model_name,
+                    self.world_size,
+                    self.blocks_in_chunk,
+                    self._mq_timeout,
+                    layout_hints=layout_hints,
+                    engine_group_infos=self.engine_group_infos,
+                    engine_type=EngineType.VLLM,
+                )
         except TimeoutError:
             raise ConnectionError(
                 "LMCache server did not respond to "

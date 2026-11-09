@@ -24,6 +24,7 @@ external plugin.
 from __future__ import annotations
 
 # Standard
+from functools import partial
 from typing import TYPE_CHECKING
 
 # First Party
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
     from lmcache.v1.gpu_connector.utils import LayoutHints
     from lmcache.v1.multiprocess.custom_types import KVCache
     from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+    from lmcache.v1.multiprocess.pp_layout import PPRegistrationInfo
     from lmcache.v1.platform.base.cache_context import BaseCacheContext
 
 
@@ -81,6 +83,7 @@ def create_cache_context(
     engine_type: EngineType = EngineType.VLLM,
     separate_object_groups: bool = False,
     full_sw_kv: bool = False,
+    registration_info: PPRegistrationInfo | None = None,
 ) -> BaseCacheContext:
     """Create the appropriate cache context for *kv_caches*.
 
@@ -109,6 +112,8 @@ def create_cache_context(
             per-chunk KV (no sub-chunk window cutting) so chunks stay valid for
             reuse at any position; see
             :meth:`KVLayerGroupsManager.enable_full_sw_kv`.
+        registration_info: Internal PP metadata selecting the registration
+            factory. None preserves the existing device factory dispatch.
 
     Returns:
         A concrete cache context instance.
@@ -129,7 +134,13 @@ def create_cache_context(
             "entry point provides a DeviceSpec whose ``create_cache_context`` "
             "hook returns a BaseCacheContext instance." % device_type
         )
-    return spec.create_cache_context(
+    factory = spec.create_cache_context
+    if registration_info is not None:
+        factory = partial(
+            spec.create_cache_context_for_registration,
+            registration_info=registration_info,
+        )
+    return factory(
         kv_caches,
         lmcache_tokens_per_chunk,
         layout_hints,

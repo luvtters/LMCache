@@ -22,6 +22,7 @@ from lmcache.v1.multiprocess.custom_types import (
 )
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.v1.multiprocess.pp_layout import PPRegistrationAck, PPRegistrationInfo
 from lmcache.v1.multiprocess.transfer_context.base import (
     EngineDrivenContext,
     EngineDrivenContextMetadata,
@@ -542,6 +543,59 @@ class LMCacheDrivenTransferContext(TransferContext):
         self._device = device
         self._event_backend = event_backend
         self._mq_timeout = mq_timeout
+
+    def register_pp(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        model_name: str,
+        world_size: int,
+        mq_timeout: float,
+        registration_info: PPRegistrationInfo,
+        layout_hints: LayoutHints | None = None,
+        engine_group_infos: Sequence[EngineGroupInfo] = (),
+        engine_type: EngineType = EngineType.VLLM,
+    ) -> PPRegistrationAck:
+        """Register one complete-stage worker through the PP-only RPC.
+
+        Args:
+            kv_caches: Final edited KV tensors in registered layer order.
+            model_name: Original cache model identity, before PP decoration.
+            world_size: Stage-local KV piece count.
+            mq_timeout: Maximum wait for the registration acknowledgement.
+            registration_info: Stable worker binding retained across recovery.
+            layout_hints: Device KV format hints.
+            engine_group_infos: Engine groups referencing the ordered tensors.
+            engine_type: Engine that produced the KV tensors.
+
+        Returns:
+            The server-derived profile and accepted namespace.
+
+        Raises:
+            RuntimeError: Event IPC is unsupported or this context was closed.
+            TimeoutError: The server did not acknowledge within the MQ budget.
+        """
+        device = _get_kv_device(kv_caches)
+        event_backend = get_event_ipc_backend(device)
+        event_backend.check_event_support(device)
+        future = self._submit_registration(
+            lambda: self._req_client.register_pp_kv_cache(
+                self._instance_id,
+                wrap_kv_caches(kv_caches),
+                model_name,
+                world_size,
+                engine_type,
+                layout_hints or {},
+                list(engine_group_infos),
+                registration_info,
+            )
+        )
+        ack = future.result(timeout=mq_timeout)
+        if self._is_closed():
+            raise RuntimeError("PP transfer context closed during registration")
+        self._device = device
+        self._event_backend = event_backend
+        self._mq_timeout = mq_timeout
+        return ack
 
     def create_recorded_event(self) -> IPCEvent:
         """Create and record an exportable event for handle-based transfer.

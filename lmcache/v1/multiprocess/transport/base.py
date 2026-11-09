@@ -23,6 +23,12 @@ from lmcache.v1.multiprocess.custom_types import (
 )
 from lmcache.v1.multiprocess.futures import MessagingFuture, MessagingStream
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.v1.multiprocess.pp_layout import (
+    PPRegistrationAck,
+    PPRegistrationInfo,
+    PPStageLocator,
+    PPStageStatus,
+)
 from lmcache.v1.multiprocess.protocols.server_module import (
     ServerModuleCallRequest,
     ServerModuleCallResponse,
@@ -56,6 +62,28 @@ class RequestClient(Protocol):
         layout_hints: LayoutHints,
         engine_group_infos: list[EngineGroupInfo],
     ) -> MessagingFuture[None]: ...
+
+    @rpc_method
+    def register_pp_kv_cache(
+        self,
+        instance_id: int,
+        kv_cache: list[DeviceIPCWrapper],
+        model_name: str,
+        world_size: int,
+        engine_type: EngineType,
+        layout_hints: LayoutHints,
+        engine_group_infos: list[EngineGroupInfo],
+        registration_info: PPRegistrationInfo,
+    ) -> MessagingFuture[PPRegistrationAck]:
+        """Register one PP worker and return its server-derived profile."""
+        ...
+
+    @rpc_method
+    def get_pp_stage_status(
+        self, locator: PPStageLocator
+    ) -> MessagingFuture[PPStageStatus]:
+        """Read the live registration profile and complete TP slot set."""
+        ...
 
     @rpc_method
     def unregister_kv_cache(self, instance_id: int) -> MessagingFuture[None]: ...

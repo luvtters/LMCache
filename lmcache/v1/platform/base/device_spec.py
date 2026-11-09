@@ -37,6 +37,8 @@ from lmcache.v1.multiprocess.transfer_mode import MPTransferMode
 from lmcache.v1.platform.base.pin_memory import PinMemoryBackend
 
 if TYPE_CHECKING:
+    from lmcache.v1.multiprocess.pp_layout import PPRegistrationInfo
+
     # First Party
     from lmcache.v1.platform.base.cache_context import BaseCacheContext
     from lmcache.v1.platform.base.device_ops import DeviceOps
@@ -290,6 +292,12 @@ class DeviceSpec:
     # ------------------------------------------------------------------
     # Cache context factory
     # ------------------------------------------------------------------
+
+    def create_cache_context_for_registration(
+        self, *args: Any, registration_info: PPRegistrationInfo | None, **kwargs: Any
+    ) -> "BaseCacheContext":
+        """Select a registration context without leaking metadata to backends."""
+        return self.create_cache_context(*args, **kwargs)
 
     def create_cache_context(self, *args: Any, **kwargs: Any) -> "BaseCacheContext":
         """Instantiate the ``BaseCacheContext`` implementation for this device.
