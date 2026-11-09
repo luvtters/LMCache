@@ -53,14 +53,6 @@ class DeviceBuffer:
 
 
 class MinimalTests(unittest.TestCase):
-    def test_local_cache_accepts_mooncake_pp_handshake(self) -> None:
-        names = [n.name for n in next(n for n in ast.parse(CONNECTOR.read_text(encoding="utf-8")).body
-                 if isinstance(n, ast.ClassDef) and n.name == "LMCacheMPConnector").body
-                 if isinstance(n, ast.FunctionDef)]
-        self.assertIn("set_xfer_handshake_metadata_pp_aware", names)
-        call = function(method(CONNECTOR, "LMCacheMPConnector", names[names.index("set_xfer_handshake_metadata_pp_aware")]), {"Any": object})
-        self.assertIsNone(call(object(), {(0, 0): "front", (1, 0): "rear"}))
-
     def apply_new_request(self, existing: list, allocated: tuple) -> SimpleNamespace:
         tree = ast.parse(CONNECTOR.read_text(encoding="utf-8"))
         loops = [n for n in ast.walk(tree) if isinstance(n, ast.For)
@@ -97,14 +89,14 @@ class MinimalTests(unittest.TestCase):
     def test_no_blocks_are_fabricated(self) -> None:
         self.assertEqual(self.apply_new_request([], ()).allocated_block_ids, [])
 
-    def test_index_source_is_pinned_without_changing_values(self) -> None:
+    def test_shared_index_source_keeps_original_memory_policy(self) -> None:
         torch = SimpleNamespace(Tensor=HostTensor, long="int64",
                                 frombuffer=lambda values, dtype: HostTensor(values))
         call = function(method(CONTEXT, "BaseCacheContext", "stage_block_ids"),
                         {"torch": torch, "array": array})
         buffer = DeviceBuffer()
         views = call(SimpleNamespace(block_ids_buffer_=buffer), [[12, 35], [], [47]])
-        self.assertTrue(buffer.source.pinned)
+        self.assertFalse(buffer.source.pinned)
         self.assertEqual(buffer.source.values, [12, 35, 47])
         self.assertTrue(buffer.non_blocking)
         self.assertEqual(len(views), 3)

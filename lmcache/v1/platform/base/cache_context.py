@@ -353,7 +353,7 @@ class BaseCacheContext(ABC):
                 "size %d" % (total, self.block_ids_buffer_.shape[0])
             )
         if total:
-            cpu_tensor = torch.frombuffer(flat, dtype=torch.long).pin_memory()
+            cpu_tensor = torch.frombuffer(flat, dtype=torch.long)
             self.block_ids_buffer_[:total].copy_(cpu_tensor, non_blocking=True)
 
         return [

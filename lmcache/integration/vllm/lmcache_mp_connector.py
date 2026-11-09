@@ -559,15 +559,33 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     # appends. The scheduler role sets it from the vLLM config.
     _mamba_relocation_window: int = 0
 
-    def set_xfer_handshake_metadata_pp_aware(
-        self, metadata: dict[tuple[int, int], Any]
-    ) -> None:
-        """Ignore peer PD handshake metadata for this local-cache connector.
+    def build_parallel_strategy(
+        self, vllm_config: "VllmConfig", n_servers: int
+    ) -> ParallelStrategy:
+        """Resolve cache geometry, retaining default multi-server PP rejection.
 
-        Mooncake owns P-to-D transfer; MP cache registration uses its own IPC.
-        MultiConnector must still forward the full metadata to Mooncake.
+        Device plugins may override this hook when they implement a supported
+        server-local PP layout. They must supply matching writer, reader and
+        piece identities to both scheduler and worker adapters.
+
+        Args:
+            vllm_config: Serving engine configuration.
+            n_servers: Number of cache endpoints.
+
+        Returns:
+            Geometry used by the scheduler and workers.
+
+        Raises:
+            ValueError: The default strategy cannot serve multi-server PP.
         """
-        return None
+        pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        if n_servers > 1 and pp_size > 1:
+            raise ValueError(
+                "LMCacheMPConnector multi-server mode only supports "
+                "tensor parallelism (TP), not pipeline parallelism (PP). "
+                f"Got pp_size={pp_size}."
+            )
+        return build_parallel_strategy_from_vllm_config(vllm_config, n_servers)
 
     def __init__(
         self,
@@ -697,24 +715,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "supported in a follow-up PR."
             )
 
-        # Multi-server + MLA: only TP is supported (no PP).
-        # PP splits layers across nodes, which would cause per-piece
-        # reader counts to vary per (server, pp_stage) pair and break
-        # the single-``tp_size`` LOOKUP / FREE_LOOKUP_LOCKS protocol.
-        # Non-MLA mode is not affected by this restriction.
-        if n_servers > 1:
-            pp_size = vllm_config.parallel_config.pipeline_parallel_size
-            if pp_size > 1:
-                raise ValueError(
-                    "LMCacheMPConnector multi-server mode only supports "
-                    "tensor parallelism (TP), not pipeline parallelism (PP). "
-                    f"Got pp_size={pp_size}."
-                )
-
+        parallel_strategy = self.build_parallel_strategy(vllm_config, n_servers)
         zmq_context = zmq.Context.instance()
-        parallel_strategy = build_parallel_strategy_from_vllm_config(
-            vllm_config, n_servers
-        )
 
         self.dispatcher = None
 
