@@ -46,3 +46,25 @@ timeout, incomplete stage or incompatible profile is an initialization error,
 not a fallback to an older cache namespace. Existing RPC payload counts and data
 transfer operations remain unchanged. Regenerate protobuf bindings after changing
 the schema in a fresh interpreter before importing device frameworks.
+
+## PP initialization errors over ZMQ
+
+The synchronous `register_pp_kv_cache` and `get_pp_stage_status` handlers return
+validation, payload-decoding, type and runtime failures as a private error frame:
+
+```text
+ROUTER: [identity, request_uid, operation, b"lmcache.pp.error.v1", error_body]
+DEALER: [request_uid, operation, b"lmcache.pp.error.v1", error_body]
+error_body = msgpack((exception_type_name, message))  # two strings
+```
+
+The server sends this response from its polling thread. After matching the
+operation, the client resolves the pending future with `ValueError` for a remote
+`ValueError`, or `RuntimeError` for other returned exception types; the exception
+includes the operation, remote type and reason. A malformed marked error response
+also resolves the future with `RuntimeError`, rather than losing it to a timeout.
+The typed success response, protobuf schema, public RPC parameters, original
+seven-payload registration RPC and all legacy RPC error paths are unchanged.
+This frame applies only to these two PP synchronous operations; an older server
+that does not implement them can still time out. It does not add retries, a
+fallback namespace, blocking-handler error transport or device validation.

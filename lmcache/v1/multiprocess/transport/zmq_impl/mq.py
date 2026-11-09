@@ -45,6 +45,9 @@ T = TypeVar("T")
 # Internal type used for the client-server communication
 RequestUID = int
 
+_PP_ERROR_OPERATIONS = frozenset({"register_pp_kv_cache", "get_pp_stage_status"})
+_PP_ERROR_MARKER = b"lmcache.pp.error.v1"
+
 
 # Helper functions
 def encode_request_uid(uid: RequestUID) -> bytes:
@@ -397,6 +400,9 @@ class MessageQueueClient:
         Called by the shared ClientPollingLoop when the DEALER socket
         is readable.  Only touches ``pending_futures``, which is
         exclusively accessed from the loop thread.
+
+        PP initialization error frames complete the matching future with an
+        exception before decoding the ordinary typed response.
         """
         msg = self.socket.recv_multipart()
         if len(msg) < 2:
@@ -432,6 +438,32 @@ class MessageQueueClient:
                         f"Response operation {operation!r} does not match "
                         f"request {rpc_spec.operation!r}"
                     )
+                )
+                return
+            if (
+                operation in _PP_ERROR_OPERATIONS
+                and b_response
+                and b_response[0] == _PP_ERROR_MARKER
+            ):
+                try:
+                    if len(b_response) != 2:
+                        raise ValueError("Expected marker and error body")
+                    error_type, message = msgspec.msgpack.decode(
+                        b_response[1], type=tuple[str, str]
+                    )
+                except (ValueError, TypeError, msgspec.DecodeError) as exc:
+                    logger.exception("Malformed PP error response for %s", operation)
+                    future.set_exception(
+                        RuntimeError(
+                            f"Malformed PP error response for {operation}: {exc}"
+                        )
+                    )
+                    return
+                exception_cls = (
+                    ValueError if error_type == "ValueError" else RuntimeError
+                )
+                future.set_exception(
+                    exception_cls(f"Remote {operation} raised {error_type}: {message}")
                 )
                 return
             if b_response:
@@ -651,12 +683,30 @@ class MessageQueueServer(RequestServer):
         """
         Call the sync handler and send the response back to the client.
 
+        The two PP initialization operations return a private versioned error
+        frame on validation, decoding, type or runtime failures; legacy failures
+        still propagate.
+
         Args:
             handler_entry (SyncRequestHandler[Any]): The handler entry.
             payloads (list[bytes]): The payloads of the request.
             prefix_frames (list[bytes]): The prefix frames to send back.
         """
-        response = handler_entry(payloads)
+        try:
+            response = handler_entry(payloads)
+        except (ValueError, TypeError, RuntimeError, msgspec.DecodeError) as exc:
+            operation = decode_operation(prefix_frames[2])
+            if operation not in _PP_ERROR_OPERATIONS:
+                raise
+            logger.exception("Error handling PP operation %s", operation)
+            self.socket.send_multipart(
+                prefix_frames
+                + [
+                    _PP_ERROR_MARKER,
+                    msgspec.msgpack.encode((type(exc).__name__, str(exc))),
+                ]
+            )
+            return
         if isinstance(response, MessagingStream):
             self._start_stream(
                 response, handler_entry.get_response_class(), prefix_frames
