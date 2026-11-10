@@ -101,6 +101,7 @@ class Harness:
             cache_context=self.cache,
             model_name="test-model",
             event_backend=self.backend,
+            registration_info=SimpleNamespace(read_policy="transfer_borrow"),
         )
         bus = SimpleNamespace(
             publish=lambda event: self.mark("publish"),
@@ -122,6 +123,7 @@ class Harness:
             world_size=1, start=0, end=8,
         )
         self.namespace = {
+            "TRANSFER_BORROW": "transfer_borrow",
             "logger": logging.getLogger("borrowed-retrieve-test"),
             "torch_dev": SimpleNamespace(
                 device=lambda device: nullcontext(),
@@ -301,6 +303,15 @@ class BorrowedRetrieveContractTest(unittest.TestCase):
         self.assertEqual(h.run(), (b"", False))
         self.assertEqual(h.trace, [])
 
+    def test_retrieve_rejects_unnegotiated_or_legacy_registration(self):
+        for registration in (None, SimpleNamespace(read_policy="legacy")):
+            with self.subTest(registration=registration):
+                h = Harness()
+                h.entry.registration_info = registration
+                with self.assertRaisesRegex(ValueError, "negotiated PP"):
+                    h.run()
+                self.assertEqual(h.trace, [])
+
 
 class PPBorrowPolicyContractTest(unittest.TestCase):
     @classmethod
@@ -337,6 +348,20 @@ class PPBorrowPolicyContractTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "read policies differ"):
                     register(owner, 1, [], "model", 2, "engine", {}, [], info)
         self.assertEqual(calls, [])
+
+    def test_old_registration_endpoint_cannot_bypass_policy_negotiation(self):
+        namespace = {"TRANSFER_BORROW": "transfer_borrow", "time": time}
+        register = load_method(namespace, SOURCE, "LMCacheDrivenTransferModule",
+                               "register_kv_cache")
+        # Existing legacy slots must not bypass the guard through NOOP refresh.
+        for entries in ({}, {1: SimpleNamespace(registration_info=None)}):
+            with self.subTest(existing=bool(entries)):
+                owner = SimpleNamespace(
+                    _ctx=SimpleNamespace(read_policy="transfer_borrow"),
+                    _lock=nullcontext(), _cache_contexts=entries,
+                )
+                with self.assertRaisesRegex(ValueError, "negotiated PP"):
+                    register(owner, 1, [], "model", 2, "engine", {}, [])
 
     def test_scheduler_requires_same_policy_and_complete_ranks_on_both_stages(self):
         path = ROOT / "lmcache/integration/vllm/vllm_multi_process_adapter.py"
@@ -399,6 +424,47 @@ class PPBorrowPolicyContractTest(unittest.TestCase):
         status = get_status(owner, locators[0])
         self.assertTrue(status.ready)
         self.assertEqual(status.read_policy, "transfer_borrow")
+
+
+class BorrowedTransferShutdownTest(unittest.TestCase):
+    def test_drain_before_dispatcher_stop_and_owner_release(self):
+        self.check_close(fail=False)
+
+    def test_failed_drain_retains_context_owners_and_dispatcher(self):
+        self.check_close(fail=True)
+
+    def check_close(self, fail):
+        namespace = {"TRANSFER_BORROW": "transfer_borrow"}
+        close = load_method(namespace, SOURCE, "LMCacheDrivenTransferModule", "close")
+        trace = []
+
+        def sync(index):
+            trace.append(f"sync{index}")
+            if fail and index == 1:
+                raise RuntimeError("unknown transfer completion")
+
+        entries = {i: SimpleNamespace(cache_context=SimpleNamespace(
+            stream=SimpleNamespace(synchronize=lambda index=i: sync(index))))
+            for i in range(2)}
+        owner = SimpleNamespace(
+            _ctx=SimpleNamespace(read_policy="transfer_borrow"),
+            context_entries_snapshot=lambda: dict(entries),
+            _cache_contexts=entries,
+            _registration_lock=nullcontext(), _lock=nullcontext(),
+            _device_host_func_dispatcher=SimpleNamespace(
+                stop=lambda: trace.append("drain_callbacks")),
+            _release_entries=lambda removed: trace.append("release_owners"),
+        )
+        if fail:
+            with self.assertRaises(RuntimeError):
+                close(owner)
+            self.assertEqual(trace, ["sync0", "sync1"])
+            self.assertEqual(len(entries), 2)
+        else:
+            close(owner)
+            self.assertEqual(trace,
+                             ["sync0", "sync1", "drain_callbacks", "release_owners"])
+            self.assertEqual(entries, {})
 
 
 if __name__ == "__main__":
