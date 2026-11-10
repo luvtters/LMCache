@@ -68,3 +68,23 @@ record this as a diagnostic run rather than an uninstrumented performance run.
 The standalone capture checks exercise real detached start, duplicate-start
 rejection, HTTP sampling, fresh-log-only capture, flood bounds, summary/stop,
 and a fixed old-log snapshot. They do not start any inference/device process.
+
+## Model process commands
+
+`python3 pp_model.py status|stop|start` inspects or controls the model associated
+with `/opt/ks-luv-pp/startpp.sh` and private `logs/pp-*.log` descriptors. It
+excludes cache, benchmark and observer processes and protects the caller's
+ancestors. Stop signals the wrapper and actual model entry, lets the entry
+drain its workers, checks PID start identities and refuses a new start if old
+model processes remain. `--force` explicitly enables killing only verified
+model remnants after the graceful timeout. Unidentified vLLM processes stop
+the launch rather than being killed or duplicated.
+
+Start preserves the original startup script, arguments and calling directory,
+creates a detached process and a new private log, and reports submitted rather
+than ready. It requires a healthy cache with no old GPU registrations. For
+two-host PP: stop on both hosts first, start host 85 then immediately host 86,
+and check health on 85. Cache and observer processes remain running. The model
+control checks cover ownership, PID reuse, wrapper/entry signaling, duplicate
+launch prevention and stale-registration rejection using CPU substitutes; no
+customer services were started or stopped during those checks.
