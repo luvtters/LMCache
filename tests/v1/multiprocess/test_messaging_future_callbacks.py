@@ -238,7 +238,7 @@ def test_actual_control_callbacks_order_endpoint_cleanup(completed_first):
     endings["fast"].set_result(None)
     with pytest.raises(RuntimeError):
         registry.check_reuse("request")
-    controls["slow"].set_exception(RuntimeError("lookup failed"))
+    controls["slow"].set_result(None)
     assert sent == [("fast", "request"), ("slow", "request")]
     endings["slow"].set_result(None)
     registry.check_reuse("request")

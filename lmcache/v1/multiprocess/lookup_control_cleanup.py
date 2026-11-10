@@ -20,6 +20,7 @@ class _Cleanup:
         self.dependencies: dict[str, list[Any]] = {url: [] for url in clients}
         self.ending = False
         self.started: set[str] = set()
+        self.failed: set[str] = set()
         self.end_futures: dict[str, Any] = {}
         self.completed: set[str] = set()
         self._lock = threading.Lock()
@@ -47,9 +48,20 @@ class _Cleanup:
 
     def _advance(self, url: str) -> None:
         with self._lock:
-            if not self.ending or url in self.started:
+            if not self.ending or url in self.started or url in self.failed:
                 return
             if not all(future.query() for future in self.dependencies[url]):
+                return
+            try:
+                for dependency in self.dependencies[url]:
+                    dependency.result(timeout=0)
+            except Exception:
+                # A failed transport response (for example a cancelled gRPC)
+                # does not prove the remote handler stopped. Do not let END
+                # acknowledge before that unknown handler and permit ID reuse.
+                self.failed.add(url)
+                logger.exception("Lookup outcome unknown for %s at %s; retain generation",
+                                 self.request_id, url)
                 return
             self.started.add(url)
         try:

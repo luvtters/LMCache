@@ -76,6 +76,19 @@ def test_admission_cleanup_retains_controls_without_ending_session(adapter):
         obj._check_lookup_reuse("request")
 
 
+def test_control_exception_does_not_prove_server_handler_quiescence(adapter):
+    obj, lookups, status, endings, sent = adapter
+    obj.end_session("request")
+    lookups['fast'].set_result(None)
+    status['fast'].set_result(1)
+    endings['fast'].set_result(None)
+    lookups['slow'].set_exception(ConnectionError('remote outcome unknown'))
+    status['slow'].set_result(None)
+    assert sent == [('fast', 'request')]
+    with pytest.raises(RuntimeError):
+        obj._check_lookup_reuse('request')
+
+
 def test_each_endpoint_ends_after_its_own_controls_without_global_health(adapter):
     obj, lookups, status, endings, sent = adapter
     obj.cleanup_lookup_result("request")
@@ -101,7 +114,9 @@ def test_end_session_without_prior_cleanup_retains_and_orders_controls(adapter):
     assert not sent
     lookups["fast"].set_exception(RuntimeError("lookup failed"))
     status["fast"].set_result(None)
-    assert sent == [("fast", "request")]
+    assert sent == []
+    with pytest.raises(RuntimeError):
+        obj._check_lookup_reuse("request")
 
 
 def test_failed_end_ack_keeps_request_id_quarantined(adapter):
