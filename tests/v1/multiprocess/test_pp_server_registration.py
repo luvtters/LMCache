@@ -62,6 +62,7 @@ class PPServerRegistrationTest(unittest.TestCase):
         self.capacity = 50
         self.gate = SimpleNamespace(SYNC=0, BLOCKING=1, NON_BLOCKING=2)
         self.namespace = dict(
+            TRANSFER_BORROW="transfer_borrow",
             dataclass=dataclass,
             replace=replace,
             threading=threading,
