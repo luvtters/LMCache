@@ -8,8 +8,11 @@ ordering and failure handling, not DMA correctness or performance.
 import ast
 from contextlib import nullcontext
 from dataclasses import dataclass
+import importlib.util
 import logging
 from pathlib import Path
+import sys
+import time
 from types import SimpleNamespace
 import unittest
 
@@ -24,15 +27,15 @@ class Token:
     sequence: int
 
 
-def load_retrieve(namespace):
-    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+def load_method(namespace, source, class_name, method_name):
+    tree = ast.parse(source.read_text(encoding="utf-8"))
     owner = next(
         n for n in tree.body
-        if isinstance(n, ast.ClassDef) and n.name == "LMCacheDrivenTransferModule"
+        if isinstance(n, ast.ClassDef) and n.name == class_name
     )
     method = next(
         n for n in owner.body
-        if isinstance(n, ast.FunctionDef) and n.name == "_retrieve_borrowed"
+        if isinstance(n, ast.FunctionDef) and n.name == method_name
     )
     method.decorator_list = []
     future = ast.ImportFrom(
@@ -41,8 +44,14 @@ def load_retrieve(namespace):
     module = ast.fix_missing_locations(
         ast.Module(body=[future, method], type_ignores=[])
     )
-    exec(compile(module, str(SOURCE), "exec"), namespace)
-    return namespace["_retrieve_borrowed"]
+    exec(compile(module, str(source), "exec"), namespace)
+    return namespace[method_name]
+
+
+def load_retrieve(namespace):
+    return load_method(
+        namespace, SOURCE, "LMCacheDrivenTransferModule", "_retrieve_borrowed"
+    )
 
 
 class Harness:
@@ -291,6 +300,105 @@ class BorrowedRetrieveContractTest(unittest.TestCase):
         h.entry = None
         self.assertEqual(h.run(), (b"", False))
         self.assertEqual(h.trace, [])
+
+
+class PPBorrowPolicyContractTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Real stdlib-only protocol dataclasses, loaded without framework imports.
+        spec = importlib.util.spec_from_file_location(
+            "_borrow_test_pp_layout", ROOT / "lmcache/v1/multiprocess/pp_layout.py"
+        )
+        cls.protocol = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = cls.protocol
+        spec.loader.exec_module(cls.protocol)
+
+    def stages(self, policies):
+        p = self.protocol
+        locators = [p.PPStageLocator("model", 2, 2, rank, ((0, 1), (1, 2)))
+                    for rank in range(2)]
+        profiles = [p.PPStageProfile(loc, (f"layer{loc.pp_rank}",), False, "{}")
+                    for loc in locators]
+        statuses = [p.PPStageStatus(loc, f"server{rank}", profiles[rank], (0, 1),
+                                   read_policy=policies[rank])
+                    for rank, loc in enumerate(locators)]
+        return locators, profiles, statuses
+
+    def test_registration_rejects_mixed_policy_before_device_context_creation(self):
+        calls = []
+        namespace = {"create_cache_context": lambda *a, **k: calls.append("create")}
+        register = load_method(namespace, SOURCE, "LMCacheDrivenTransferModule",
+                               "register_pp_kv_cache")
+        for server, worker in (("legacy", "transfer_borrow"),
+                               ("transfer_borrow", "legacy")):
+            with self.subTest(server=server, worker=worker):
+                owner = SimpleNamespace(_ctx=SimpleNamespace(read_policy=server))
+                info = SimpleNamespace(read_policy=worker)
+                with self.assertRaisesRegex(ValueError, "read policies differ"):
+                    register(owner, 1, [], "model", 2, "engine", {}, [], info)
+        self.assertEqual(calls, [])
+
+    def test_scheduler_requires_same_policy_and_complete_ranks_on_both_stages(self):
+        path = ROOT / "lmcache/integration/vllm/vllm_multi_process_adapter.py"
+        namespace = {
+            "PPStageStatus": self.protocol.PPStageStatus,
+            "get_read_policy": lambda: "transfer_borrow",
+            "time": time,
+            "logger": logging.getLogger("borrow-policy-test"),
+        }
+        initialize = load_method(namespace, path, "LMCacheMPSchedulerAdapter",
+                                 "_initialize_pp_stage_profiles")
+        for kind in ("uniform", "mixed", "incomplete"):
+            with self.subTest(kind=kind):
+                policies = ("transfer_borrow",
+                            "legacy" if kind == "mixed" else "transfer_borrow")
+                locators, profiles, statuses = self.stages(policies)
+                if kind == "incomplete":
+                    statuses[1] = self.protocol.PPStageStatus(
+                        locators[1], "server1", profiles[1], (0,),
+                        read_policy="transfer_borrow",
+                    )
+                clients = {
+                    url: SimpleNamespace(get_pp_stage_status=lambda loc, value=status:
+                        SimpleNamespace(result=lambda timeout: value))
+                    for url, status in zip(("first", "second"), statuses)
+                }
+                owner = SimpleNamespace(
+                    _server_urls=["first", "second"], _mq_timeout=3,
+                    req_clients=clients, world_size=2,
+                    parallel_strategy=SimpleNamespace(mla_only=False, num_kv_readers=1),
+                    _server_model_names={"old": "unchanged"},
+                )
+                if kind == "uniform":
+                    initialize(owner, locators)
+                    self.assertEqual(owner._server_model_names,
+                        {"first": profiles[0].cache_namespace,
+                         "second": profiles[1].cache_namespace})
+                else:
+                    with self.assertRaises(ValueError):
+                        initialize(owner, locators)
+                    self.assertEqual(owner._server_model_names, {"old": "unchanged"})
+
+    def test_stage_status_reports_server_policy_snapshot(self):
+        locators, profiles, _ = self.stages(("transfer_borrow", "transfer_borrow"))
+        namespace = {"PPStageStatus": self.protocol.PPStageStatus}
+        get_status = load_method(namespace, SOURCE, "LMCacheDrivenTransferModule",
+                                 "get_pp_stage_status")
+        entries = {
+            rank: SimpleNamespace(
+                registration_info=SimpleNamespace(locator=locators[0], tp_rank=rank),
+                pp_profile=profiles[0],
+            ) for rank in range(2)
+        }
+        owner = SimpleNamespace(
+            _registration_lock=nullcontext(),
+            _ctx=SimpleNamespace(read_policy="transfer_borrow"),
+            _server_instance_id="server0",
+            context_entries_snapshot=lambda: entries,
+        )
+        status = get_status(owner, locators[0])
+        self.assertTrue(status.ready)
+        self.assertEqual(status.read_policy, "transfer_borrow")
 
 
 if __name__ == "__main__":
