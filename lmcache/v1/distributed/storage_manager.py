@@ -15,6 +15,7 @@ import time
 from lmcache.lmcache_native import PeriodicEventNotifier
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import (
+    BorrowedRead,
     CapacitySnapshot,
     L1BackendType,
     MemoryLayoutDesc,
@@ -23,6 +24,7 @@ from lmcache.v1.distributed.api import (
     PrefetchHandle,
     PrefetchResult,
     PrefetchTaskSpec,
+    ReadBorrowToken,
     Tier,
 )
 from lmcache.v1.distributed.config import (
@@ -1254,10 +1256,32 @@ class StorageManager:
         for manager in self._l1_managers_by_id.values():
             manager.clear(force=force)
 
+    def _borrow_manager(self) -> L1Manager:
+        """The first borrow implementation has a single concrete L1 owner."""
+        if self.is_multi_l1:
+            raise ValueError("Read borrows require a single L1 manager")
+        if not isinstance(self._l1_manager, L1Manager):
+            raise ValueError("Read borrows require the resident L1Manager backend")
+        return self._l1_manager
+
+    def borrow_read(self, keys: list[ObjectKey]) -> BorrowedRead | None:
+        """Borrow resident buffers atomically; no L2 fetch or TTL reservation."""
+        return self._borrow_manager().borrow_read(keys)
+
+    def release_borrow(self, token: ReadBorrowToken) -> bool:
+        """Release a completed transfer's single-L1 borrow exactly once."""
+        return self._borrow_manager().release_borrow(token)
+
     def close(self):
         """
         Close the storage manager and release all resources.
         """
+        # Refuse shutdown before stopping dependencies used by in-flight reads.
+        # prepare_close takes and releases only the manager lock; controller
+        # stop/join must happen outside it so their final callbacks can finish.
+        for manager in self._l1_managers_by_id.values():
+            if isinstance(manager, L1Manager):
+                manager.prepare_close()
         self._prefetch_controller.stop()
         for controller in self._store_controllers.values():
             controller.stop()

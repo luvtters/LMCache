@@ -8,12 +8,19 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import count
 import threading
+import uuid
 import weakref
 
 # First Party
 from lmcache.lmcache_native import TTLLock
 from lmcache.logging import init_logger
-from lmcache.v1.distributed.api import L1BackendType, MemoryLayoutDesc, ObjectKey
+from lmcache.v1.distributed.api import (
+    BorrowedRead,
+    L1BackendType,
+    MemoryLayoutDesc,
+    ObjectKey,
+    ReadBorrowToken,
+)
 from lmcache.v1.distributed.config import L1ManagerConfig, get_configured_capacity_bytes
 from lmcache.v1.distributed.error import L1Error, L1ReconfigureError
 from lmcache.v1.distributed.internal_api import (
@@ -104,6 +111,9 @@ class L1ObjectState:
 
     is_temporary: bool
     """ Whether the object is temporary (need to be deleted after read). """
+
+    active_borrows: int = 0
+    """ Non-expiring transfer ownership; never changed by anonymous TTL readers. """
 
 
 def l1_mgr_synchronized(func):
@@ -200,6 +210,14 @@ class L1Manager(L1ManagerInterface):
         self._config = config
         self._l1_manager_id = next_l1_manager_id()
         self._lock = threading.Lock()
+        self._close_lock = threading.Lock()
+        self._closing = False
+        self._closed = False
+        self._borrow_instance_id = str(uuid.uuid4())
+        self._borrow_sequence = count(1)
+        # Keep entry identities, not merely keys: a late token must never touch
+        # a different allocation subsequently admitted under the same key.
+        self._read_borrows: dict[ReadBorrowToken, dict[ObjectKey, L1ObjectState]] = {}
 
         # Resident objects: readable, never write-locked.
         self._objects: dict[ObjectKey, L1ObjectState] = {}
@@ -287,6 +305,62 @@ class L1Manager(L1ManagerInterface):
         with self._lock:
             self._registered_listeners.append(listener)
 
+    def _ensure_open(self) -> None:
+        """Called under the manager lock before admitting work."""
+        if self._closing:
+            raise RuntimeError("L1Manager is closing or closed")
+
+    @l1_mgr_synchronized
+    def borrow_read(self, keys: list[ObjectKey]) -> BorrowedRead | None:
+        """Atomically borrow all resident buffers, or retain nothing on a miss.
+
+        Unlike reserve_read, ownership cannot expire. The caller must release
+        only after all device work using the returned buffers has completed.
+        Staging entries are not eligible; repeated keys own one count per token.
+        """
+        self._ensure_open()
+        entries: dict[ObjectKey, L1ObjectState] = {}
+        for key in keys:
+            entry = self._objects.get(key)
+            if entry is None:
+                return None
+            entries[key] = entry
+        token = ReadBorrowToken(self._borrow_instance_id, next(self._borrow_sequence))
+        borrowed = BorrowedRead(
+            token, {key: entry.memory_obj for key, entry in entries.items()}
+        )
+        self._read_borrows[token] = entries
+        for entry in entries.values():
+            entry.active_borrows += 1
+        return borrowed
+
+    @l1_mgr_synchronized
+    def release_borrow(self, token: ReadBorrowToken) -> bool:
+        """Release exactly this token, once; unknown or old tokens return False.
+
+        Uses only the L1 lock, with the same allocator/listener ordering as
+        finish_read. Callbacks must not hold a dependent allocator lock.
+        """
+        entries = self._read_borrows.pop(token, None)
+        if entries is None:
+            return False
+        keys_to_free: list[ObjectKey] = []
+        objects_to_free: list[MemoryObj] = []
+        for key, entry in entries.items():
+            entry.active_borrows -= 1
+            if (
+                entry.is_temporary
+                and entry.active_borrows == 0
+                and not entry.read_lock.is_locked()
+                and self._objects.get(key) is entry
+            ):
+                del self._objects[key]
+                keys_to_free.append(key)
+                objects_to_free.append(entry.memory_obj)
+        if keys_to_free:
+            self._free_and_report_deleted(keys_to_free, objects_to_free)
+        return True
+
     @l1_mgr_synchronized
     def reserve_read(
         self,
@@ -314,6 +388,7 @@ class L1Manager(L1ManagerInterface):
             Staging objects are never readable; a key that is only
             being written is reported as ``KEY_NOT_EXIST``.
         """
+        self._ensure_open()
         total = validate_read_locks(read_locks)
         ret: dict[ObjectKey, L1OperationResult] = {}
         successful_keys: list[ObjectKey] = []
@@ -356,6 +431,7 @@ class L1Manager(L1ManagerInterface):
             KEY_NOT_EXIST: The key does not exist.
             KEY_NOT_READABLE: The key is not readable (in this case, not read-locked).
         """
+        self._ensure_open()
         ret: dict[ObjectKey, L1OperationResult] = {}
 
         for key in keys:
@@ -432,7 +508,11 @@ class L1Manager(L1ManagerInterface):
             # overhead (TTLLock is C++ std::atomic).
             for _ in range(total):
                 entry.read_lock.unlock()
-            if entry.is_temporary and not entry.read_lock.is_locked():
+            if (
+                entry.is_temporary
+                and not entry.read_lock.is_locked()
+                and entry.active_borrows == 0
+            ):
                 need_to_free.append(entry.memory_obj)
                 need_to_free_keys.append(key)
                 del self._objects[key]
@@ -501,6 +581,7 @@ class L1Manager(L1ManagerInterface):
             it is admitted. Different tags may stage the same key at the same
             time.
         """
+        self._ensure_open()
         if len(keys) != len(is_temporary):
             raise ValueError(
                 f"L1Manager.reserve_write: {len(keys)} keys but "
@@ -615,6 +696,7 @@ class L1Manager(L1ManagerInterface):
             is discarded, the resident object is kept and ``SUCCESS`` is
             still reported: the data is in L1 either way.
         """
+        self._ensure_open()
         ret: dict[ObjectKey, L1Error] = {}
         notification_keys: list[ObjectKey] = []
         notification_keys_meta: list[L1ObjectMeta] = []
@@ -693,6 +775,7 @@ class L1Manager(L1ManagerInterface):
             the read locks are taken on the resident object, so the caller
             always holds the object that readers see.
         """
+        self._ensure_open()
         total = validate_read_locks(read_locks)
         ret: dict[ObjectKey, L1OperationResult] = {}
         successful_keys: list[ObjectKey] = []
@@ -756,7 +839,8 @@ class L1Manager(L1ManagerInterface):
             force: When True, delete even a read-locked key and discard its
                 live staging objects. This may free memory a concurrent
                 store/read still uses (same hazard as :meth:`clear` with
-                ``force=True``); use with care.
+                ``force=True``); use with care. Active transfer borrows are
+                always protected, even with force.
 
         Returns:
             A dictionary mapping each object key to an L1Error.
@@ -764,8 +848,8 @@ class L1Manager(L1ManagerInterface):
         Errors:
             KEY_NOT_EXIST: The key does not exist.
             KEY_IS_LOCKED: The key is read-locked, or a live staging object
-                exists for it, so it cannot be deleted. Never returned when
-                ``force`` is True.
+                exists for it, or a transfer borrow still owns the buffer.
+                Active borrows also return this error when ``force`` is True.
         """
         need_to_free: list[MemoryObj] = []
         ret: dict[ObjectKey, L1Error] = {}
@@ -776,6 +860,10 @@ class L1Manager(L1ManagerInterface):
             entry = self._objects.get(key, None)
             if entry is None and key not in self._staging:
                 ret[key] = L1Error.KEY_NOT_EXIST
+                continue
+
+            if entry is not None and entry.active_borrows:
+                ret[key] = L1Error.KEY_IS_LOCKED
                 continue
 
             self._reclaim_staging(key, force)
@@ -873,27 +961,31 @@ class L1Manager(L1ManagerInterface):
         """Clear objects from L1 cache.
 
         Args:
-            force: If True, clear ALL objects including read-locked ones and
-                every staging object. This may corrupt in-flight
+            force: If True, clear objects including TTL read-locked ones and
+                every staging object, except active transfer borrows. This
+                may corrupt in-flight
                 store/prefetch operations. If False (default), only clear
                 unlocked resident objects and staging objects whose write
                 lock expired, keeping read-locked objects and live staging
-                objects intact.
+                objects intact. Active transfer borrows are always kept.
         """
         if force:
             staging_count = sum(len(per_tag) for per_tag in self._staging.values())
             logger.warning(
-                "L1Manager: force-clearing all %d objects and %d staging objects "
-                "(including locked ones). This may corrupt in-flight "
+                "L1Manager: force-clearing up to %d objects and %d staging objects "
+                "(active borrows are kept). This may corrupt in-flight "
                 "store/prefetch operations — use with caution.",
                 len(self._objects),
                 staging_count,
             )
-            all_keys = list(self._objects.keys())
-            all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
+            all_keys = [
+                key for key, entry in self._objects.items() if not entry.active_borrows
+            ]
+            all_memory_objs = [self._objects[key].memory_obj for key in all_keys]
             all_meta = [self._object_meta(obj) for obj in all_memory_objs]
             self._memory_manager.free(all_memory_objs)
-            self._objects.clear()
+            for key in all_keys:
+                del self._objects[key]
             for listener in self._registered_listeners:
                 listener.on_l1_keys_deleted_by_manager(all_keys)
             self._event_bus.publish(
@@ -907,14 +999,18 @@ class L1Manager(L1ManagerInterface):
                 )
             )
             cleared = set(all_keys)
-            staging_keys = [k for k in self._staging if k not in cleared]
+            staging_keys = [
+                k for k in self._staging if k not in cleared and k not in self._objects
+            ]
             for key in list(self._staging.keys()):
                 self._reclaim_staging(key, force=True)
             self._report_staging_gone(staging_keys)
             logger.info(
-                "L1Manager: cleared %d objects and %d staging objects, 0 remaining.",
+                "L1Manager: cleared %d objects and %d staging objects, "
+                "%d borrowed objects remaining.",
                 len(all_keys),
                 staging_count,
+                len(self._objects),
             )
             return
 
@@ -923,7 +1019,7 @@ class L1Manager(L1ManagerInterface):
         locked_count = 0
 
         for key, entry in list(self._objects.items()):
-            if entry.read_lock.is_locked():
+            if entry.read_lock.is_locked() or entry.active_borrows:
                 locked_count += 1
                 continue
             keys_to_clear.append(key)
@@ -969,6 +1065,8 @@ class L1Manager(L1ManagerInterface):
             or a staging object whose write lock expired; False otherwise.
         """
         entry = self._objects.get(key, None)
+        if entry is not None and entry.active_borrows:
+            return False
         if entry is not None and not entry.read_lock.is_locked():
             return True
         per_tag = self._staging.get(key, None)
@@ -1138,19 +1236,39 @@ class L1Manager(L1ManagerInterface):
         """Return this manager's backend and lifetime configuration."""
         return self._config
 
-    def close(self) -> None:
-        """Close the L1Manager and free all resources."""
-        close_l1_gds_context(self._l1_manager_id)
-        with self._lock:
-            all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
-            for per_tag in self._staging.values():
-                all_memory_objs.extend(staged.memory_obj for staged in per_tag.values())
-            self._memory_manager.free(all_memory_objs)
-            self._objects.clear()
-            self._staging.clear()
-            self._staging_bytes = 0
+    @l1_mgr_synchronized
+    def prepare_close(self) -> None:
+        """Reject active transfers before closing dependencies; stop admission."""
+        if self._read_borrows:
+            raise RuntimeError("Cannot close L1Manager with active read borrows")
+        self._closing = True
 
-        self._memory_manager.close()
+    def close(self) -> None:
+        """Close resources only after every active transfer borrow is released."""
+        with self._close_lock:
+            with self._lock:
+                if self._closed:
+                    return
+                if self._read_borrows:
+                    raise RuntimeError("Cannot close L1Manager with active read borrows")
+                self._closing = True
+            # Device draining may wait for legacy callbacks that acquire _lock.
+            # Admission is closed, but their completion must remain possible.
+            close_l1_gds_context(self._l1_manager_id)
+            with self._lock:
+                all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
+                for per_tag in self._staging.values():
+                    all_memory_objs.extend(
+                        staged.memory_obj for staged in per_tag.values()
+                    )
+                self._memory_manager.free(all_memory_objs)
+                self._objects.clear()
+                self._staging.clear()
+                self._staging_bytes = 0
+            self._memory_manager.close()
+            with self._lock:
+                self._closed = True
+
         with L1Manager._gauge_lock:
             L1Manager._gauge_targets.pop(self._l1_manager_id, None)
 

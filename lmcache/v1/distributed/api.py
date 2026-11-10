@@ -20,6 +20,7 @@ from lmcache.logging import init_logger
 if TYPE_CHECKING:
     # First Party
     from lmcache.lmcache_native import Bitmap
+    from lmcache.v1.memory_management import MemoryObj
     from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 
 logger = init_logger(__name__)
@@ -243,6 +244,25 @@ class ObjectKey:
             The parallel setup's world size (TP x PP).
         """
         return (kv_rank >> 24) & 0xFF
+
+
+@dataclass(frozen=True)
+class ReadBorrowToken:
+    """Identity of one non-expiring read borrow in one L1 server instance."""
+
+    server_instance_id: str
+    sequence: int
+
+
+@dataclass
+class BorrowedRead:
+    """Resident buffers protected until this token is explicitly released.
+
+    Objects stay in the server; only the token may cross a completion callback.
+    """
+
+    token: ReadBorrowToken
+    objects: dict[ObjectKey, "MemoryObj"]
 
 
 @dataclass(frozen=True)
