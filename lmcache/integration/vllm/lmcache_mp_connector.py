@@ -822,6 +822,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "(enable_prefix_caching=True)"
             )
 
+        # Requests whose scheduler explicitly requested delayed freeing.
+        self._delay_free_req_ids: set[str] = set()
+
         if self.role == KVConnectorRole.SCHEDULER:
             # Banner from the scheduler role only, so tensor-parallel
             # deployments print it once rather than once per worker.
@@ -1029,6 +1032,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, LMCacheMPConnectorMetadata)
+        self._delay_free_req_ids.update(metadata.delay_free_req_ids)
 
         request_ids = []
         ops = []
@@ -1183,9 +1187,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         else:
             # The adapter reports engine-finished IDs even without a STORE.
             # Consumers never delay frees for saves, but must still poll retrieves.
-            val = self.worker_adapter.get_finished(
+            sending, receiving = self.worker_adapter.get_finished(
                 finished_req_ids if self._can_store else set()
             )
+            # Only a scheduler-authorized delayed free may report a send.
+            sending = set(sending or ()) & self._delay_free_req_ids
+            self._delay_free_req_ids -= sending
+            val = (sending, receiving)
         # logger.error("Finished req ids: %s, %s", val[0], val[1])
         return val
 
@@ -1595,6 +1603,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         metadata = LMCacheMPConnectorMetadata()
         metadata.need_flush_before_forward = _has_preemption_reqs(scheduler_output)
+        metadata.delay_free_req_ids = self._delay_free_req_ids
+        self._delay_free_req_ids = set()
 
         self._process_retrieve_requests(metadata)
         self._process_new_requests(scheduler_output, metadata)
@@ -1677,6 +1687,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "num_lmcache_extra_cached_tokens": max(0, num_lmcache - num_vllm),
             }
 
+        # Delay only if STORE metadata was issued for this tracker.
+        tracker = self.request_trackers.get(request.request_id)
+        delay_free = tracker is not None and tracker.store_scheduled
+
         # Clean up request tracker to prevent memory leak
         self._cleanup_request_tracker(request.request_id)
 
@@ -1696,7 +1710,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         # Notify LMCache to end the session for this request
         self.scheduler_adapter.end_session(request.request_id)
-        return self._can_store, (return_params or None)
+        if delay_free:
+            self._delay_free_req_ids.add(request.request_id)
+        return delay_free, (return_params or None)
 
     def request_finished_all_groups(
         self,
@@ -1841,6 +1857,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                     self._lazy_offload_manager.add_store_candidate(r_meta)
                 else:
                     metadata.add_request_metadata(r_meta)
+                    request_tracker.store_scheduled = True
 
     def _process_cached_requests(
         self,
@@ -1881,6 +1898,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                     self._lazy_offload_manager.add_store_candidate(r_meta)
                 else:
                     metadata.add_request_metadata(r_meta)
+                    request_tracker.store_scheduled = True
 
     def _report_block_allocation_deltas(
         self,
