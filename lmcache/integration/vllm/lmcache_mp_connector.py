@@ -797,7 +797,15 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "supported in a follow-up PR."
             )
 
+        from lmcache.v1.multiprocess.read_policy import (
+            get_read_policy, validate_connector_policy,
+        )
+        self._read_policy = get_read_policy()
         parallel_strategy = self.build_parallel_strategy(vllm_config, n_servers)
+        validate_connector_policy(
+            self._read_policy, stage_local=parallel_strategy.pp_stage_local,
+            failure_policy=getattr(vllm_config.kv_transfer_config, "kv_load_failure_policy", "fail"),
+        )
         pp_stage_locators: tuple[PPStageLocator, ...] = ()
         if parallel_strategy.pp_stage_local:
             server_urls = normalize_pp_server_urls(server_urls)
@@ -1414,6 +1422,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             tracker.num_stored_tokens = 0
             tracker.num_vllm_hit_tokens = 0
             tracker.num_lmcache_hit_tokens = 0
+            tracker.borrowed_restore_submitted = False
             tracker.state = LMCacheMPRequestState.BYPASS_LMCACHE
             return 0, False
 
@@ -1451,7 +1460,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         assert ret % self.scheduler_adapter.lmcache_tokens_per_chunk == 0
 
-        tracker.num_stored_tokens = ret
+        # A hint can be evicted before transfer. Only legacy treats it as
+        # successful storage progress; the borrow path may need full recompute.
+        if getattr(self, "_read_policy", "legacy") != "transfer_borrow":
+            tracker.num_stored_tokens = ret
         tracker.num_lmcache_hit_tokens = ret
 
         need_to_load = max(0, ret - num_computed_tokens)
@@ -1820,6 +1832,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             )
             if r_metadata is not None:
                 metadata.add_request_metadata(r_metadata)
+                if getattr(self, "_read_policy", "legacy") == "transfer_borrow":
+                    request_tracker.borrowed_restore_submitted = True
             request_tracker.state = LMCacheMPRequestState.READY
 
     def _process_new_requests(
@@ -1831,6 +1845,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         for new_request in scheduler_output.scheduled_new_reqs:
             request_tracker = self._get_request_tracker(new_request.req_id)
+            if getattr(self, "_read_policy", "legacy") == "transfer_borrow":
+                request_tracker.confirm_borrowed_restore(
+                    getattr(new_request, "num_computed_tokens", 0), lmcache_tokens_per_chunk
+                )
 
             # MultiConnector may pass empty blocks to a non-selected loader,
             # but a writer still needs the scheduler's allocated block ids.
@@ -1869,6 +1887,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         cached_reqs = scheduler_output.scheduled_cached_reqs
         for idx, request_id in enumerate(cached_reqs.req_ids):
             request_tracker = self._get_request_tracker(request_id)
+            if getattr(self, "_read_policy", "legacy") == "transfer_borrow":
+                computed = getattr(cached_reqs, "num_computed_tokens", ())
+                request_tracker.confirm_borrowed_restore(
+                    computed[idx] if computed else 0, lmcache_tokens_per_chunk
+                )
 
             # Update block ids
             new_block_ids = cached_reqs.new_block_ids[idx] or ()

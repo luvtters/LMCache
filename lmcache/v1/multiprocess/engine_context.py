@@ -21,6 +21,7 @@ from lmcache.v1.mp_observability.event_bus import EventBus, get_event_bus
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.session import SessionManager
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
+from lmcache.v1.multiprocess.read_policy import get_read_policy, TRANSFER_BORROW
 
 logger = init_logger(__name__)
 
@@ -207,6 +208,12 @@ class MPCacheServerContext:
         null_block_id: int = 0,
         session_ttl_seconds: float = SessionManager.DEFAULT_SESSION_TTL,
     ) -> None:
+        self.read_policy = get_read_policy()
+        if self.read_policy == TRANSFER_BORROW:
+            if storage_manager_config.l2_adapter_config.adapters:
+                raise ValueError("transfer_borrow currently supports resident L1 only")
+            if len(storage_manager_config.l1_manager_configs) != 1:
+                raise ValueError("transfer_borrow currently requires exactly one L1")
         self._chunk_size = chunk_size
         self._null_block_id = null_block_id
         self._separate_object_groups = separate_object_groups

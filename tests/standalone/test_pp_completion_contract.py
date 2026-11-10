@@ -47,6 +47,7 @@ sys.modules[module.__name__] = module
 ns = module.__dict__
 ns.update(dataclass=dataclass, field=field, enum=enum,
           logger=logging.getLogger("completion-contract"), ConstantList=list,
+          get_read_policy=lambda: "legacy",
           KVConnectorMetadata=object,
           extract_request_configs_from_request=lambda request: None,
           extract_mm_features=lambda request: ([], []),

@@ -618,6 +618,15 @@ class PrefetchController(StorageControllerInterface):
         with self._prefetch_results_lock:
             return self._completed_results.pop(request_id, None)
 
+    def discard_prefetch_result(self, request_id: PrefetchRequestId) -> None:
+        """Discard a completed result after an L1-only submission has returned.
+
+        L1-only submit finishes synchronously on its calling thread. This is
+        deliberately not cancellation of an asynchronous L2 prefetch.
+        """
+        with self._prefetch_results_lock:
+            self._completed_results.pop(request_id, None)
+
     def wait_prefetch_result(
         self, request_id: PrefetchRequestId, timeout: float
     ) -> bool:

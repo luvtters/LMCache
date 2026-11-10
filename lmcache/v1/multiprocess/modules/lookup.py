@@ -15,6 +15,7 @@ from lmcache.v1.distributed.api import (
     ObjectKey,
     PrefetchHandle,
     PrefetchTaskSpec,
+    PrefetchLockMode,
     ipc_key_to_grouped_object_keys,
     ipc_key_to_object_keys,
 )
@@ -25,6 +26,7 @@ from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
+from lmcache.v1.multiprocess.read_policy import TRANSFER_BORROW
 
 logger = init_logger(__name__)
 
@@ -298,6 +300,11 @@ class LookupModule:
                 attn_desc,
             ),
             num_kv_readers=num_kv_readers,
+            lock_mode=(
+                PrefetchLockMode.NO_LOCK
+                if getattr(self._ctx, "read_policy", "legacy") == TRANSFER_BORROW
+                else PrefetchLockMode.LOCK
+            ),
         )
         handle = self._ctx.storage_manager.submit_prefetch_task(
             spec,
@@ -409,6 +416,8 @@ class LookupModule:
             key: Cache key whose read locks should be released.
             tp_size: Legacy wire field; ignored (kept for payload arity).
         """
+        if getattr(self._ctx, "read_policy", "legacy") == TRANSFER_BORROW:
+            return
         if key.start >= key.end:
             return
 
@@ -465,6 +474,11 @@ class LookupModule:
         Args:
             request_id: The request ID whose session should be removed.
         """
+        if getattr(self._ctx, "read_policy", "legacy") == TRANSFER_BORROW:
+            with self._prefetch_job_lock:
+                job = self._prefetch_jobs.pop(request_id, None)
+            if job is not None:
+                self._ctx.storage_manager.discard_prefetch_result(job.handle)
         self._ctx.event_bus.publish(
             Event(
                 event_type=EventType.MP_VLLM_END_SESSION,
@@ -561,12 +575,13 @@ class LookupModule:
         # free_lookup_locks can reconstruct which keys the prefetch
         # read-locked (see ``unfold``: full-attention groups lock the whole
         # hit prefix, sliding-window groups only its in-window suffix).
-        session = self._ctx.session_manager.get_or_create(job.request_id)
-        session.record_prefetch_result(
-            found_count,
-            tuple(range(job.attn_desc.num_object_groups)),
-            result.l1_owners,
-        )
+        if getattr(self._ctx, "read_policy", "legacy") != TRANSFER_BORROW:
+            session = self._ctx.session_manager.get_or_create(job.request_id)
+            session.record_prefetch_result(
+                found_count,
+                tuple(range(job.attn_desc.num_object_groups)),
+                result.l1_owners,
+            )
 
         # L1 is credited with the prefix its own cells serve under the same
         # window rule; L2 with however far it extended that prefix.

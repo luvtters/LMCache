@@ -3,6 +3,7 @@
 import gc
 import logging
 import threading
+from types import SimpleNamespace
 import weakref
 
 # Third Party
@@ -10,6 +11,7 @@ import pytest
 
 # First Party
 from lmcache.v1.multiprocess.futures import DeviceMessagingFuture, MessagingFuture
+from lmcache.v1.multiprocess.lookup_control_cleanup import LookupControlRegistry
 
 
 @pytest.mark.parametrize("completed_first", [False, True])
@@ -211,3 +213,32 @@ def test_device_future_rejects_callbacks_before_and_after_raw_rpc_completion():
     with pytest.raises(NotImplementedError, match="device"):
         device.add_done_callback(lambda done: seen.append(done))
     assert not seen
+
+
+@pytest.mark.parametrize("completed_first", [False, True])
+def test_actual_control_callbacks_order_endpoint_cleanup(completed_first):
+    registry = LookupControlRegistry()
+    controls = {url: MessagingFuture() for url in ("slow", "fast")}
+    endings = {url: MessagingFuture() for url in controls}
+    sent = []
+
+    def end(url, request_id):
+        sent.append((url, request_id))
+        return endings[url]
+
+    clients = {url: SimpleNamespace(end_session=lambda rid, url=url: end(url, rid))
+               for url in controls}
+    if completed_first:
+        controls["fast"].set_result(None)
+    registry.retain("request", clients, {url: [future] for url, future in controls.items()})
+    registry.end("request")
+    if not completed_first:
+        controls["fast"].set_result(None)
+    assert sent == [("fast", "request")]
+    endings["fast"].set_result(None)
+    with pytest.raises(RuntimeError):
+        registry.check_reuse("request")
+    controls["slow"].set_exception(RuntimeError("lookup failed"))
+    assert sent == [("fast", "request"), ("slow", "request")]
+    endings["slow"].set_result(None)
+    registry.check_reuse("request")

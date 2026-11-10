@@ -111,8 +111,11 @@ class PPRegistrationInfo:
     layer_names: tuple[str, ...]
     registration_token: str
     mla_only: bool
+    read_policy: str = "legacy"
 
     def __post_init__(self) -> None:
+        if self.read_policy not in ("legacy", "transfer_borrow"):
+            raise ValueError("unsupported PP read policy")
         _integer(self.global_rank, "global_rank")
         _integer(self.tp_rank, "tp_rank")
         if self.tp_rank >= self.locator.tp_size or self.global_rank != (
@@ -189,8 +192,11 @@ class PPRegistrationAck:
     server_instance_id: str
     instance_id: int
     tp_rank: int
+    read_policy: str = "legacy"
 
     def __post_init__(self) -> None:
+        if self.read_policy not in ("legacy", "transfer_borrow"):
+            raise ValueError("unsupported PP read policy")
         _text(self.server_instance_id, "server_instance_id")
         _integer(self.instance_id, "instance_id")
         _integer(self.tp_rank, "tp_rank")
@@ -212,8 +218,11 @@ class PPStageStatus:
     profile: PPStageProfile | None
     registered_tp_ranks: tuple[int, ...]
     schema_version: int = 1
+    read_policy: str = "legacy"
 
     def __post_init__(self) -> None:
+        if self.read_policy not in ("legacy", "transfer_borrow"):
+            raise ValueError("unsupported PP read policy")
         _text(self.server_instance_id, "server_instance_id")
         if type(self.schema_version) is not int or self.schema_version != 1:
             raise ValueError("unsupported PP schema version")

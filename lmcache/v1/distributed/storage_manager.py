@@ -664,6 +664,11 @@ class StorageManager:
             )
         return result
 
+    def discard_prefetch_result(self, handle: PrefetchHandle) -> None:
+        """Retire a cancelled NO_LOCK lookup without keeping its result."""
+        if handle.prefetch_request_id != -1:
+            self._prefetch_controller.discard_prefetch_result(handle.prefetch_request_id)
+
     def wait_prefetch_status(
         self,
         handle: PrefetchHandle,

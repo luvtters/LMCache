@@ -19,6 +19,7 @@ from lmcache.utils import (
 from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
     ObjectKey,
+    ReadBorrowToken,
 )
 from lmcache.v1.distributed.storage_manager import L1WriteCompletion
 from lmcache.v1.gpu_connector.utils import LayoutHints
@@ -50,6 +51,7 @@ from lmcache.v1.multiprocess.pp_layout import (
 )
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
+from lmcache.v1.multiprocess.read_policy import TRANSFER_BORROW
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
 from lmcache.v1.platform.base.event_ipc import (
     EventIPCBackend,
@@ -276,7 +278,14 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             self._release_imported_event,
             payload_type=tuple[int, int],
         )
+        self._device_host_func_dispatcher.register(
+            "release_read_borrow", self._release_read_borrow,
+            payload_type=tuple[str, int],
+        )
         self._device_host_func_dispatcher.start()
+
+    def _release_read_borrow(self, payload: tuple[str, int]) -> None:
+        self._ctx.storage_manager.release_borrow(ReadBorrowToken(*payload))
 
     def _release_imported_event(self, payload: tuple[int, int]) -> None:
         """Drop an imported worker event; the stream wait queued on it has run.
@@ -497,6 +506,13 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
     def close(self) -> None:
         """Release GPU resources owned by this module."""
+        if getattr(self._ctx, "read_policy", "legacy") == TRANSFER_BORROW:
+            # The server has stopped admission before closing modules. Drain
+            # device streams while the dispatcher and imported contexts are
+            # still alive; stop() then consumes their final host callbacks.
+            # On failure keep context owners and borrowed allocations intact.
+            for entry in self.context_entries_snapshot().values():
+                entry.cache_context.stream.synchronize()
         # Stop the drain thread before storage_manager.close() so any
         # in-flight completions reach a live storage manager.
         self._device_host_func_dispatcher.stop()
@@ -533,6 +549,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             engine_group_infos: Engine-neutral KV cache group metadata
                 (already msgspec-decoded by the message queue).
         """
+        if getattr(self._ctx, "read_policy", "legacy") == TRANSFER_BORROW:
+            raise ValueError("transfer_borrow requires negotiated PP registration")
         now = time.monotonic()
         # NOOP-register: an already-registered instance (e.g. a recovering
         # worker re-registering on its first ping) refreshes its last-seen
@@ -632,6 +650,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             RuntimeError: If platform context/event initialization fails.
         """
         info = registration_info
+        read_policy = getattr(self._ctx, "read_policy", "legacy")
+        if info.read_policy != read_policy:
+            raise ValueError("Worker and cache server read policies differ")
         if model_name != info.locator.base_model_name:
             raise ValueError("PP base model does not match locator")
         expected_world = 1 if info.mla_only else info.locator.tp_size
@@ -662,6 +683,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             namespace = profile.cache_namespace
             backend = get_event_ipc_backend(cache_context.device)
             backend.check_event_support(cache_context.device)
+            if read_policy == TRANSFER_BORROW and str(cache_context.device).split(":")[0] != "npu":
+                raise ValueError("transfer_borrow currently supports NPU lmcache_driven only")
             manager = cache_context.kv_layer_groups_manager
             layouts = {
                 gid: get_layout_desc(cache_context, self._ctx.chunk_size, gid)
@@ -680,7 +703,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     with self._lock:
                         existing.last_seen = time.monotonic()
                     return PPRegistrationAck(
-                        profile, self._server_instance_id, instance_id, info.tp_rank
+                        profile, self._server_instance_id, instance_id, info.tp_rank,
+                        read_policy=read_policy,
                     )
                 for _, peer in peers:
                     peer_info = peer.registration_info
@@ -702,7 +726,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                                 "PP TP slot already has an active instance"
                             )
                 ack = PPRegistrationAck(
-                    profile, self._server_instance_id, instance_id, info.tp_rank
+                    profile, self._server_instance_id, instance_id, info.tp_rank,
+                    read_policy=read_policy,
                 )
                 try:
                     self._ctx.layout_desc_registry.register(
@@ -753,7 +778,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             ]
             ranks = tuple(sorted(entry.registration_info.tp_rank for entry in matching))
             profile = matching[0].pp_profile if matching else None
-            return PPStageStatus(locator, self._server_instance_id, profile, ranks)
+            return PPStageStatus(
+                locator, self._server_instance_id, profile, ranks,
+                read_policy=getattr(self._ctx, "read_policy", "legacy"),
+            )
 
     @request_handler()
     def unregister_kv_cache(self, instance_id: int) -> None:
@@ -1112,6 +1140,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         Raises:
             RuntimeError: If the backend does not support IPC event handles.
         """
+        if getattr(self._ctx, "read_policy", "legacy") == TRANSFER_BORROW:
+            return self._retrieve_borrowed(
+                key, instance_id, gpu_block_ids, event_ipc_handle, skip_first_n_tokens
+            )
         st = time.perf_counter()
 
         entry = self.get_and_touch_context_entry(instance_id)
@@ -1334,6 +1366,114 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             event_backend.export_event(event, cache_context.device),
             retrieve_succeeded,
         )
+
+    def _retrieve_borrowed(
+        self, key: IPCCacheServerKey, instance_id: int,
+        gpu_block_ids: list[list[int]], event_ipc_handle: bytes,
+        skip_first_n_tokens: int,
+    ) -> tuple[bytes, bool]:
+        """Borrow every source before device submission; release in stream order.
+
+        A lookup is only a hint in this mode. A resident miss submits no device
+        work. Exceptions after submission must drain the stream before replying
+        without an event; failure to drain retains the borrow and is a safety
+        error, never permission to reuse the source or destination allocation.
+        """
+        entry = self.get_and_touch_context_entry(instance_id)
+        if entry is None:
+            return b"", False
+        if entry.registration_info is None or entry.registration_info.read_policy != TRANSFER_BORROW:
+            raise ValueError("Borrowed RETRIEVE requires negotiated PP read policy")
+        context = entry.cache_context
+        backend = entry.event_backend
+        if backend is None:
+            raise RuntimeError("Registered cache context has no event backend")
+        manager = context.kv_layer_groups_manager
+        keys_by_group = self._ctx.resolve_obj_keys(key, list(range(manager.num_object_groups)))
+        num_chunks = len(keys_by_group[0])
+        blocks_per_chunk = [context.calculate_num_blocks(self._ctx.chunk_size, g)
+                            for g in range(manager.num_kernel_groups)]
+        if len(gpu_block_ids) != len(blocks_per_chunk) or any(
+            len(ids) < num_chunks * bpc
+            for ids, bpc in zip(gpu_block_ids, blocks_per_chunk, strict=True)
+        ):
+            return b"", False
+        attn = manager.get_attn_desc()
+        skipped = {g for g, kind in enumerate(attn.group_kinds) if kind == "aux"}
+        skips = [0 if w < 0 else max(0, num_chunks - w) for w in attn.num_chunks_in_sw]
+        retained = [k for g, keys in enumerate(keys_by_group) if g not in skipped
+                    for k in keys[skips[g]:]]
+        borrow = self._ctx.storage_manager.borrow_read(retained)
+        if borrow is None:
+            logger.info("RETRIEVE resident miss request_id=%s; recompute required", key.request_id)
+            return b"", False
+        token_payload = (borrow.token.server_instance_id, borrow.token.sequence)
+        total_bytes = sum(obj.get_size() for obj in borrow.objects.values())
+        transfer_key = next_transfer_key(key.request_id)
+        submitted = False
+        try:
+            with torch_dev.device(context.device), torch_dev.stream(context.stream):
+                event = backend.create_event(context.device)
+                submitted = True
+                self._ctx.event_bus.publish(Event(
+                    event_type=EventType.MP_RETRIEVE_SUBMITTED, session_id=key.request_id,
+                    metadata={"device": str(context.device)},
+                ))
+                self._ctx.event_bus.publish_on_stream(context.cupy_stream, Event(
+                    event_type=EventType.MP_RETRIEVE_START, session_id=key.request_id,
+                    metadata={"device": str(context.device), "engine_id": instance_id,
+                              "model_name": entry.model_name, "transfer_key": transfer_key},
+                ))
+                producer = backend.import_event(event_ipc_handle, context.device)
+                backend.wait_event(producer, context.stream)
+                import_token = context.hold_imported_event(producer)
+                try:
+                    submit_callback_to_stream(context.cupy_stream, "release_imported_event",
+                                              (instance_id, import_token))
+                except Exception:
+                    context.stream.synchronize()
+                    context.release_imported_event(import_token)
+                    raise
+                staged_ids = downsample_and_stage_block_ids(context, gpu_block_ids)
+                succeeded = True
+                try:
+                    for group, keys in enumerate(keys_by_group):
+                        if group in skipped:
+                            continue
+                        objects = [borrow.objects[k] for k in keys[skips[group]:]]
+                        transfer_kv_per_object_group(
+                            context, staged_ids, [None] * skips[group] + objects,
+                            object_group_id=group, batch_size=context.max_batch_size,
+                            skip_first_n_tokens=skip_first_n_tokens,
+                            direction=lmcache_native.TransferDirection.H2D,
+                            transfer_key=transfer_key, block_ids_host=gpu_block_ids,
+                        )
+                except Exception:
+                    logger.exception("Borrowed RETRIEVE transfer failed request_id=%s", key.request_id)
+                    succeeded = False
+                backend.record_event(event, context.stream)
+                submit_callback_to_stream(context.cupy_stream, "release_read_borrow", token_payload)
+                self._ctx.event_bus.publish_on_stream(context.cupy_stream, Event(
+                    event_type=EventType.MP_RETRIEVE_END, session_id=key.request_id,
+                    metadata={"retrieved_count": len(retained) if succeeded else 0,
+                              "device": str(context.device), "engine_id": instance_id,
+                              "model_name": entry.model_name, "cache_salt": key.cache_salt,
+                              "total_bytes": total_bytes if succeeded else 0,
+                              "num_tokens": num_chunks * self._ctx.chunk_size if succeeded else 0,
+                              "transfer_key": transfer_key},
+                ))
+                return backend.export_event(event, context.device), succeeded
+        except Exception:
+            logger.exception("Borrowed RETRIEVE completion failed request_id=%s", key.request_id)
+            if submitted:
+                try:
+                    context.stream.synchronize()
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Cannot prove RETRIEVE device completion; retain borrowed KV and isolate worker"
+                    ) from exc
+            self._ctx.storage_manager.release_borrow(borrow.token)
+            return b"", False
 
     def _publish_token_bindings(
         self, key: IPCCacheServerKey, obj_keys: list[ObjectKey]

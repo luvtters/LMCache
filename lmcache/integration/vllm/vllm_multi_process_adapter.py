@@ -56,6 +56,8 @@ from lmcache.v1.multiprocess.pp_layout import (
     PPStageStatus,
 )
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
+from lmcache.v1.multiprocess.read_policy import get_read_policy
+from lmcache.v1.multiprocess.lookup_control_cleanup import LookupControlRegistry
 from lmcache.v1.multiprocess.transfer_context import (
     LMCacheDrivenTransferContext,
     TransferContext,
@@ -863,6 +865,8 @@ class LMCacheMPSchedulerAdapter:
             status = futures[url].result(timeout=max(0.0, deadline - time.monotonic()))
             if not isinstance(status, PPStageStatus):
                 raise ValueError(f"PP server {url} returned an incompatible status")
+            if status.read_policy != get_read_policy():
+                raise ValueError(f"PP server {url} uses a different read policy")
             if status.locator != locator or not status.ready or status.profile is None:
                 raise ValueError(
                     f"PP server {url} has incomplete or mismatched registration"
@@ -961,6 +965,12 @@ class LMCacheMPSchedulerAdapter:
         if request_id in self._pending_lookups:
             # Skip if there is already a lookup request
             return
+
+        if get_read_policy() == "transfer_borrow":
+            self._check_lookup_reuse(request_id)
+            if not hasattr(self, "_lookup_deadlines"):
+                self._lookup_deadlines = {}
+            self._lookup_deadlines[request_id] = time.monotonic() + self._mq_timeout
 
         lookup_tokens = max(0, len(token_ids) - int(reserve_last_token))
         aligned_end = (
@@ -1063,6 +1073,8 @@ class LMCacheMPSchedulerAdapter:
             # Return the cached aggregate if any, otherwise 0.
             return self._finished_lookup_results.get(request_id, 0)
 
+        deadline = getattr(self, "_lookup_deadlines", {}).get(request_id)
+
         if not self.is_healthy:
             # Server went down — give up on this lookup
             return 0
@@ -1082,10 +1094,12 @@ class LMCacheMPSchedulerAdapter:
                 url: fut for url, fut in ack.futures.items() if not fut.query()
             }
             if ack.futures:
-                if time.monotonic() - ack.submitted_at >= self._mq_timeout:
+                if (time.monotonic() >= deadline if deadline is not None else
+                        time.monotonic() - ack.submitted_at >= self._mq_timeout):
                     for url in ack.futures:
                         self._mark_lookup_timed_out(url)
-                    del self._unacked_lookups[request_id]
+                    if deadline is None:
+                        del self._unacked_lookups[request_id]
                     return 0
                 # Acknowledgement still in flight; poll again next step.
                 return None
@@ -1101,6 +1115,9 @@ class LMCacheMPSchedulerAdapter:
         for url in unresolved_urls:
             # Keep the same future until its reply arrives; never restart a poll.
             if url not in futures:
+                if deadline is not None and time.monotonic() >= deadline:
+                    self._mark_lookup_timed_out(url)
+                    return 0
                 futures[url] = (
                     self.req_clients[url].query_prefetch_status(request_id),
                     time.monotonic(),
@@ -1108,14 +1125,18 @@ class LMCacheMPSchedulerAdapter:
 
         for url, (fut, submitted_at) in list(futures.items()):
             if self._nonblocking_lookup_status and not fut.query():
-                if time.monotonic() - submitted_at >= self._mq_timeout:
+                if (time.monotonic() >= deadline if deadline is not None else
+                        time.monotonic() - submitted_at >= self._mq_timeout):
                     self._mark_lookup_timed_out(url)
                     return 0
                 continue
-            del futures[url]
+            if deadline is None:
+                del futures[url]
             try:
                 r = fut.result(
-                    timeout=0 if self._nonblocking_lookup_status else self._mq_timeout
+                    timeout=(0 if self._nonblocking_lookup_status else
+                             max(0.0, deadline - time.monotonic()) if deadline is not None
+                             else self._mq_timeout)
                 )
             except TimeoutError:
                 logger.warning(
@@ -1124,7 +1145,12 @@ class LMCacheMPSchedulerAdapter:
                 )
                 self._health_events[url].clear()
                 return 0
+            if deadline is not None:
+                del futures[url]
             if r is None:
+                if deadline is not None and time.monotonic() >= deadline:
+                    self._mark_lookup_timed_out(url)
+                    return 0
                 continue
             per_server[url] = int(r)
 
@@ -1154,12 +1180,38 @@ class LMCacheMPSchedulerAdapter:
         """
         return self.blocks_in_chunk
 
+    def _retain_lookup_controls(self, request_id: str) -> Any:
+        registry = getattr(self, "_lookup_control_registry", None)
+        if registry is None:
+            registry = self._lookup_control_registry = LookupControlRegistry()
+        dependencies: dict[str, list[Any]] = {url: [] for url in self._server_urls}
+        ack = self._unacked_lookups.get(request_id)
+        if ack is not None:
+            for url, future in ack.futures.items():
+                dependencies[url].append(future)
+        for url, (future, _) in self._lookup_status.get(request_id, {}).items():
+            dependencies[url].append(future)
+        registry.retain(request_id, self.req_clients, dependencies)
+        self._unacked_lookups.pop(request_id, None)
+        self._lookup_status.pop(request_id, None)
+        return registry
+
+    def _check_lookup_reuse(self, request_id: str) -> None:
+        if get_read_policy() != "transfer_borrow":
+            return
+        registry = getattr(self, "_lookup_control_registry", None)
+        if registry is not None:
+            registry.check_reuse(request_id)
+
     def cleanup_lookup_result(self, request_id: str) -> None:
         """
         Clean up lookup state for a finished request to prevent memory leak.
         Args:
             request_id: The ID of the finished request.
         """
+        if get_read_policy() == "transfer_borrow":
+            self._retain_lookup_controls(request_id)
+        getattr(self, "_lookup_deadlines", {}).pop(request_id, None)
         self._pending_lookups.discard(request_id)
         self._unacked_lookups.pop(request_id, None)
         self._lookup_status.pop(request_id, None)
@@ -1272,6 +1324,10 @@ class LMCacheMPSchedulerAdapter:
         Args:
             request_id: The ID of the finished request.
         """
+        if get_read_policy() == "transfer_borrow":
+            registry = self._retain_lookup_controls(request_id)
+            registry.end(request_id)
+            return
         if not self.is_healthy:
             return
 
@@ -1719,6 +1775,7 @@ class LMCacheMPWorkerAdapter:
                 layer_names=tuple(kv_caches),
                 registration_token=self._pp_registration_token,
                 mla_only=self.parallel_strategy.mla_only,
+                read_policy=get_read_policy(),
             )
         for info in engine_group_infos:
             if (
@@ -1795,6 +1852,7 @@ class LMCacheMPWorkerAdapter:
                     or ack.profile.locator != info.locator
                     or ack.profile.layer_names != info.layer_names
                     or ack.profile.mla_only != info.mla_only
+                    or ack.read_policy != info.read_policy
                 ):
                     raise ValueError(
                         "PP server returned an incompatible registration ACK"
@@ -2183,6 +2241,50 @@ class LMCacheMPWorkerAdapter:
         self._returned_finished.update(ret_stores)
         return ret_stores
 
+    def _check_unhealthy_transfers(self) -> None:
+        """Bound unknown device work independently of cache-server health.
+
+        Timers follow each future's identity, so repeated polls and heartbeat
+        recovery cannot renew a pending DMA deadline. Device completion is
+        checked before deciding that an observed deadline has expired.
+        """
+        pending_since = getattr(self, "_transfer_pending_since", None)
+        if pending_since is None:
+            pending_since = self._transfer_pending_since = {}
+        futures = {
+            ("store", request_id): future
+            for request_id, future in self.store_futures.items()
+        }
+        futures.update({
+            ("retrieve", request_id): entry[0]
+            for request_id, entry in self.retrieve_futures.items()
+        })
+        for identifier in set(pending_since) - futures.keys():
+            pending_since.pop(identifier)
+        now = time.monotonic()
+        expired = []
+        try:
+            for identifier, future in futures.items():
+                if future.query():
+                    pending_since.pop(identifier, None)
+                    continue
+                previous = pending_since.get(identifier)
+                if previous is None or previous[0] is not future:
+                    pending_since[identifier] = (future, now)
+                    previous = pending_since[identifier]
+                if now - previous[1] >= self._mq_timeout:
+                    expired.append(identifier)
+        except Exception as exc:
+            raise RuntimeError(
+                "Cannot establish device transfer completion; "
+                "worker must be isolated with in-flight resources retained"
+            ) from exc
+        if expired:
+            raise RuntimeError(
+                "Worker device transfer completion remains unknown past "
+                f"mq_timeout for {expired}; isolate worker and retain resources"
+            )
+
     @_lmcache_nvtx_annotate
     def get_finished(
         self, finished_req_ids_from_engine: set[str]
@@ -2212,8 +2314,15 @@ class LMCacheMPWorkerAdapter:
         if self.dispatcher is not None:
             dispatch(self.dispatcher, "reclaim")
 
-        # If unhealthy, drain all pending futures immediately
-        if not self.is_healthy:
+        healthy = self.is_healthy
+        strict_transfers = get_read_policy() == "transfer_borrow"
+        strict_unhealthy = not healthy and strict_transfers
+        if strict_transfers:
+            self._check_unhealthy_transfers()
+
+        # Legacy mode retains its immediate unhealthy drain. Transfer borrows
+        # require device completion and continue through normal query/result.
+        if not healthy and not strict_unhealthy:
             finished_stores = set(self.store_futures.keys())
             finished_retrieves = set()
             for request_id, (
@@ -2289,9 +2398,13 @@ class LMCacheMPWorkerAdapter:
         for request_id in finished_stores:
             self.store_futures.pop(request_id, None)
             self.store_events.pop(request_id, None)
+            if strict_transfers:
+                self._transfer_pending_since.pop(("store", request_id), None)
         for request_id in finished_retrieves:
             self.retrieve_futures.pop(request_id, None)
             self.retrieve_events.pop(request_id, None)
+            if strict_transfers:
+                self._transfer_pending_since.pop(("retrieve", request_id), None)
 
         # Retrieves dropped while unhealthy still must be reported,
         # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS. No
@@ -2304,9 +2417,16 @@ class LMCacheMPWorkerAdapter:
         finished_retrieves.update(dropped)
 
         # Update the internal states
+        if strict_transfers:
+            # Engine completion cannot release blocks still targeted by DMA.
+            finished_req_ids_from_engine = finished_req_ids_from_engine - (
+                set(self.retrieve_futures) | finished_retrieves
+            )
         ret_stores = self._process_finished_stores(
             finished_stores, finished_req_ids_from_engine
         )
+        if strict_transfers:
+            ret_stores -= set(self.retrieve_futures) | finished_retrieves
 
         # the invocation of `get_finished` means that
         # these requests' KV caches are already fully stored.
@@ -2346,8 +2466,15 @@ class LMCacheMPWorkerAdapter:
         if self.dispatcher is not None:
             dispatch(self.dispatcher, "reclaim")
 
-        # If unhealthy, drain all pending futures immediately
-        if not self.is_healthy:
+        healthy = self.is_healthy
+        strict_transfers = get_read_policy() == "transfer_borrow"
+        strict_unhealthy = not healthy and strict_transfers
+        if strict_transfers:
+            self._check_unhealthy_transfers()
+
+        # Legacy mode retains its immediate unhealthy drain. Transfer borrows
+        # require device completion and continue through normal query/result.
+        if not healthy and not strict_unhealthy:
             finished_stores = set(self.store_futures.keys())
             finished_retrieves = set()
             for request_id, (
@@ -2420,9 +2547,13 @@ class LMCacheMPWorkerAdapter:
         for request_id in finished_stores:
             self.store_futures.pop(request_id, None)
             self.store_events.pop(request_id, None)
+            if strict_transfers:
+                self._transfer_pending_since.pop(("store", request_id), None)
         for request_id in finished_retrieves:
             self.retrieve_futures.pop(request_id, None)
             self.retrieve_events.pop(request_id, None)
+            if strict_transfers:
+                self._transfer_pending_since.pop(("retrieve", request_id), None)
 
         # Retrieves dropped while unhealthy still must be reported,
         # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS. No

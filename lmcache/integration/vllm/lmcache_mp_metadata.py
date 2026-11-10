@@ -68,6 +68,7 @@ class LMCacheMPRequestTracker:
 
     # Whether non-lazy STORE metadata was issued for this tracker.
     store_scheduled: bool = False
+    borrowed_restore_submitted: bool = False
 
     # Staging load operation -- save vllm and lmcache hit tokens during lookup
     num_vllm_hit_tokens: int = 0
@@ -96,6 +97,7 @@ class LMCacheMPRequestTracker:
         self.allocated_block_ids = {}
         self.num_stored_tokens = 0
         self.store_scheduled = False
+        self.borrowed_restore_submitted = False
         self.num_vllm_hit_tokens = 0
         self.num_lmcache_hit_tokens = 0
         self.state = LMCacheMPRequestState.PREFETCHING
@@ -140,6 +142,22 @@ class LMCacheMPRequestTracker:
         This function will be called when processing the cached requests.
         """
         self.num_stored_tokens += num_new_tokens
+
+    def confirm_borrowed_restore(self, num_computed_tokens: int, chunk_size: int) -> None:
+        """Confirm only when vLLM actually schedules a completed async load.
+
+        Allocation already uses the lookup hint as num_computed_tokens while
+        loading, so callers must be actual scheduled-new/cached entries.
+        A failed load resets the hint and cannot skip the recomputed STORE.
+        """
+        if not self.borrowed_restore_submitted:
+            return
+        confirmed = min(
+            self.num_lmcache_hit_tokens,
+            num_computed_tokens // chunk_size * chunk_size,
+        )
+        self.num_stored_tokens = max(self.num_stored_tokens, confirmed)
+        self.borrowed_restore_submitted = False
 
     def append_block_ids(
         self,
