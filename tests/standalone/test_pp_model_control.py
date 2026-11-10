@@ -31,9 +31,12 @@ class ModelControlChecks(unittest.TestCase):
         self.root = Path(self.temporary.name).resolve()
         self.root_patch = patch.object(control, "ROOT", self.root)
         self.root_patch.start()
+        self.kill_patch = patch.object(signal, "SIGKILL", 9, create=True)
+        self.kill_patch.start()
         self.log = str(self.root / "logs/pp-current.log")
 
     def tearDown(self) -> None:
+        self.kill_patch.stop()
         self.root_patch.stop()
         self.temporary.cleanup()
 
@@ -110,6 +113,79 @@ class ModelControlChecks(unittest.TestCase):
         with patch.object(control.urllib.request, "build_opener", return_value=opener):
             with self.assertRaisesRegex(RuntimeError, "CACHE_OLD_REGISTRATIONS_REMAIN"):
                 control.check_cache()
+
+    def test_stop_does_not_lose_a_reparented_worker(self) -> None:
+        wrapper = process(10, 1, ("bash", str(self.root / "startpp.sh")))
+        worker = process(11, 10, ("VLLM::Worker",))
+        orphan = {**worker, "ppid": 1}
+        with patch.object(control, "snapshot", side_effect=[{10: wrapper, 11: worker}, {11: orphan}, {}]), patch.object(control, "read_process", side_effect=lambda pid: {10: wrapper, 11: orphan}.get(pid, {})), patch.object(control.os, "kill") as kill, patch.object(control.time, "monotonic", side_effect=[0, 1]), patch.object(control.time, "sleep"):
+            control.stop_models(.1, True)
+            self.assertIn(call(11, signal.SIGKILL), kill.call_args_list)
+
+    def test_cache_stop_requires_model_shutdown_first(self) -> None:
+        rows = {10: process(10, 1, ("bash", str(self.root / "startpp.sh")))}
+        with patch.object(control, "snapshot", return_value=rows), patch.object(control.os, "kill") as kill:
+            with self.assertRaisesRegex(RuntimeError, "MODEL_STILL_RUNNING"):
+                control.stop_cache(.1, False)
+            kill.assert_not_called()
+
+    def test_cache_stop_targets_only_the_5565_server(self) -> None:
+        cache = process(20, 1, ("python3", "/usr/local/bin/lmcache", "server", "--port", "5565"))
+        other = process(21, 1, ("lmcache", "server", "--port", "6000"))
+        observer = process(22, 1, ("python3", "watch_pp.py", "_run"))
+        with patch.object(control, "snapshot", side_effect=[{20: cache, 21: other, 22: observer}, {21: other, 22: observer}]), patch.object(control, "read_process", return_value=cache), patch.object(control.os, "kill") as kill:
+            control.stop_cache(.1, False)
+            kill.assert_called_once_with(20, signal.SIGTERM)
+
+    def test_cache_budget_honors_cgroup_limit_and_reserve(self) -> None:
+        gib = 1 << 30
+        values = {
+            "/proc/meminfo": f"MemAvailable: {2400 * 1024**2} kB\n",
+            "/sys/fs/cgroup/memory.max": str(512 * gib),
+            "/sys/fs/cgroup/memory.current": str(128 * gib),
+        }
+        with patch.object(control, "read_text_path", side_effect=lambda p: values.get(p, "")):
+            with self.assertRaisesRegex(RuntimeError, "CACHE_MEMORY_BUDGET"):
+                control.check_cache_budget(1024)
+            control.check_cache_budget(256)
+        values["/sys/fs/cgroup/memory.max"] = "max"
+        with patch.object(control, "read_text_path", side_effect=lambda p: values.get(p, "")):
+            control.check_cache_budget(1024)
+
+    def test_cache_launch_preserves_flags_and_uses_requested_size(self) -> None:
+        (self.root / "env.sh").write_text("true\n")
+        child = types.SimpleNamespace(pid=502, poll=lambda: None, returncode=None)
+        with patch.object(control, "snapshot", return_value={}), patch.object(control, "check_cache_budget"), patch.object(control, "check_cache_ports"), patch.object(control, "wait_cache_ready") as ready, patch.object(control, "read_process", return_value={}), patch.object(control.subprocess, "Popen", return_value=child) as launch:
+            control.start_cache(1024, 600)
+            command = launch.call_args.args[0]
+            self.assertEqual(command[command.index("--l1-size-gb") + 1], "1024")
+            for flag in ("--disable-metrics", "--enable-extra-logging", "--max-gpu-workers"):
+                self.assertIn(flag, command)
+            self.assertEqual((self.root / "cache-size-gib.txt").read_text(), "1024\n")
+            ready.assert_called_once()
+
+    def test_cache_launch_refuses_an_existing_cache(self) -> None:
+        cache = process(20, 1, ("lmcache", "server", "--port", "5565"))
+        with patch.object(control, "snapshot", return_value={20: cache}), patch.object(control.subprocess, "Popen") as launch:
+            with self.assertRaisesRegex(RuntimeError, "CACHE_ALREADY_RUNNING"):
+                control.start_cache(1024, 600)
+            launch.assert_not_called()
+
+    def test_cache_ready_requires_the_requested_pool_size(self) -> None:
+        cache = process(20, 1, ("lmcache", "server", "--port", "5565"))
+        states = [{"is_healthy": True, "storage_manager": {"l1_managers": {
+            "_default": {"memory_configured_bytes": size * (1 << 30)}
+        }}} for size in (128, 1024)]
+        with patch.object(control, "read_process", return_value=cache), patch.object(control, "cache_status", side_effect=states) as status, patch.object(control.time, "sleep"):
+            control.wait_cache_ready(20, 1024, 1, self.root / "cache.log")
+            self.assertEqual(status.call_count, 2)
+
+    def test_cache_ready_reports_a_dead_process_without_signaling(self) -> None:
+        cache = process(20, 1, ("lmcache", "server", "--port", "5565"))
+        with patch.object(control, "read_process", side_effect=[cache, {}]), patch.object(control.os, "kill") as kill:
+            with self.assertRaisesRegex(RuntimeError, "CACHE_EXITED_DURING_LAUNCH"):
+                control.wait_cache_ready(20, 1024, 1, self.root / "cache.log")
+            kill.assert_not_called()
 
 
 if __name__ == "__main__":

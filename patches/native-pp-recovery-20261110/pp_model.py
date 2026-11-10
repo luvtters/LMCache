@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Inspect/start/stop only the PP model owned by /opt/ks-luv-pp/startpp.sh.
+"""Inspect/start/stop the private PP model and its port-5565 cache service.
 
-Linux container helper. Cache and independent observer processes are excluded.
-Stop verifies PID start times, uses TERM first, and refuses a new start if old
-model processes remain. --force is an explicit option for those model remnants.
+Model stop preserves cache/observers. Explicit cache-stop/cache-start require
+all model processes to exit first. Every stop checks PID start identities.
 """
 from __future__ import annotations
 
@@ -14,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -133,6 +133,16 @@ def stop_models(timeout: float, force: bool) -> None:
     """Stop the owned model roots gracefully; never stop cache/observer processes."""
     processes = snapshot()
     targets = select_models(processes, os.getpid())
+    known = {pid: processes[pid] for pid in targets}
+
+    def remaining_models() -> dict[int, dict[str, object]]:
+        """Keep captured identities even after workers become orphaned."""
+        current = snapshot()
+        for pid in select_models(current, os.getpid()):
+            known[pid] = current[pid]
+        return {pid: p for pid, p in known.items()
+                if pid in current and current[pid]["state"] != "Z"
+                and current[pid]["start"] == p["start"]}
     if not targets and unknown_models(processes, targets):
         raise RuntimeError(f"MODEL_OWNERSHIP_UNKNOWN: {unknown_models(processes, targets)}; inspect these processes first")
     roots = {pid for pid in targets if processes[pid]["ppid"] not in targets}
@@ -152,22 +162,182 @@ def stop_models(timeout: float, force: bool) -> None:
         signal_identity(processes[pid], signal.SIGTERM)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        remaining = select_models(snapshot(), os.getpid())
+        remaining = remaining_models()
         if not remaining:
             print("MODEL_STOPPED")
             return
         time.sleep(.25)
-    remaining_processes = snapshot()
-    remaining = select_models(remaining_processes, os.getpid())
+    remaining = remaining_models()
     if remaining and force:
         print("MODEL_FORCE_KILL", sorted(remaining), flush=True)
         for pid in remaining:
-            signal_identity(remaining_processes[pid], signal.SIGKILL)
+            signal_identity(remaining[pid], signal.SIGKILL)
         time.sleep(.5)
-        remaining = select_models(snapshot(), os.getpid())
+        remaining = remaining_models()
     if remaining:
         raise RuntimeError(f"MODEL_STOP_TIMEOUT: {sorted(remaining)}; no new model started. Inspect these PIDs; --force applies only to this model.")
     print("MODEL_STOPPED")
+
+
+def cache_processes(processes: dict[int, dict[str, object]]) -> dict[int, dict[str, object]]:
+    """Select only an lmcache CLI server explicitly listening on port 5565."""
+    result = {}
+    for pid, process in processes.items():
+        args = process["args"]
+        if process["state"] == "Z":
+            continue
+        for index, arg in enumerate(args[:-1]):
+            if Path(arg).name != "lmcache" or args[index + 1] != "server":
+                continue
+            options = args[index + 2:]
+            if "--port=5565" in options or any(
+                options[n:n + 2] == ("--port", "5565")
+                for n in range(len(options) - 1)
+            ):
+                result[pid] = process
+    return result
+
+
+def require_models_stopped(processes: dict[int, dict[str, object]]) -> None:
+    """Refuse cache maintenance while a model or an unidentified worker is live."""
+    models = select_models(processes, os.getpid())
+    models |= set(unknown_models(processes, models))
+    if models:
+        raise RuntimeError(f"MODEL_STILL_RUNNING: {sorted(models)}; stop models on both hosts first")
+
+
+def stop_cache(timeout: float, force: bool) -> None:
+    """Stop the verified local cache after model shutdown, preserving observers."""
+    processes = snapshot()
+    require_models_stopped(processes)
+    targets = cache_processes(processes)
+    print("CACHE_TERM_PIDS", sorted(targets), flush=True)
+    for process in targets.values():
+        signal_identity(process, signal.SIGTERM)
+    deadline = time.monotonic() + timeout
+    while True:
+        current = snapshot()
+        remaining = {pid: process for pid, process in targets.items()
+                     if pid in current and current[pid]["state"] != "Z"
+                     and current[pid]["start"] == process["start"]}
+        if not remaining:
+            print("CACHE_STOPPED")
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(.25)
+    if force:
+        print("CACHE_FORCE_KILL", sorted(remaining), flush=True)
+        for process in remaining.values():
+            signal_identity(process, signal.SIGKILL)
+        time.sleep(.5)
+        current = snapshot()
+        remaining = {pid: process for pid, process in remaining.items()
+                     if pid in current and current[pid]["state"] != "Z"
+                     and current[pid]["start"] == process["start"]}
+    if remaining:
+        raise RuntimeError(f"CACHE_STOP_TIMEOUT: {sorted(remaining)}; no new cache started")
+    print("CACHE_STOPPED")
+
+
+def read_text_path(path: str) -> str:
+    """Read a Linux status file, returning empty only when it is absent."""
+    try:
+        return Path(path).read_text().strip()
+    except FileNotFoundError:
+        return ""
+
+
+def check_cache_budget(size_gib: int) -> None:
+    """Require the requested DDR allocation plus 64 GiB in host/cgroup headroom."""
+    info = dict(line.split(":", 1) for line in read_text_path("/proc/meminfo").splitlines())
+    available = int(info["MemAvailable"].split()[0]) * 1024
+    for limit_path, used_path in (
+        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+        ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+    ):
+        limit, used = read_text_path(limit_path), read_text_path(used_path)
+        if limit and used and limit != "max":
+            available = min(available, max(0, int(limit) - int(used)))
+    print("CACHE_AVAILABLE_GIB", round(available / (1 << 30), 1),
+          "REQUESTED_GIB", size_gib, "MIN_RESERVE_GIB", 64, flush=True)
+    if available < (size_gib + 64) * (1 << 30):
+        raise RuntimeError("CACHE_MEMORY_BUDGET: insufficient host/cgroup headroom; no cache started")
+
+
+def check_cache_ports() -> None:
+    """Refuse duplicate/foreign listeners before allocating a large DDR pool."""
+    for host, port in (("0.0.0.0", 5565), ("127.0.0.1", 15565)):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind((host, port))
+
+
+def cache_status() -> dict[str, object]:
+    """Read the local management endpoint with proxies disabled."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open("http://127.0.0.1:15565/status", timeout=2) as response:
+        return json.load(response)
+
+
+def wait_cache_ready(pid: int, size_gib: int, timeout: float, log: Path) -> None:
+    """Wait for this cache's healthy configured pool; timeout never kills it."""
+    identity = read_process(pid)
+    deadline = time.monotonic() + timeout
+    next_message = 0.0
+    while time.monotonic() < deadline:
+        current = read_process(pid)
+        if not identity or not current or current["state"] == "Z" or current["start"] != identity["start"]:
+            raise RuntimeError(f"CACHE_EXITED_DURING_LAUNCH: LOG={log}")
+        try:
+            state = cache_status()
+            managers = state.get("storage_manager", {}).get("l1_managers", {})
+            capacity = sum(value.get("memory_configured_bytes", 0) for value in managers.values())
+            if state.get("is_healthy") is True and capacity == size_gib * (1 << 30):
+                print(f"CACHE_READY SIZE_GIB={size_gib} PID={pid} LOG={log}", flush=True)
+                return
+        except (OSError, ValueError):
+            pass
+        if time.monotonic() >= next_message:
+            print(f"CACHE_LOADING PID={pid} LOG={log}", flush=True)
+            next_message = time.monotonic() + 10
+        time.sleep(1)
+    raise RuntimeError(f"CACHE_NOT_READY_YET: process was preserved; inspect LOG={log}")
+
+
+def start_cache(size_gib: int, ready_timeout: float) -> None:
+    """Start the original cache configuration with a new pool and INFO statistics."""
+    processes = snapshot()
+    require_models_stopped(processes)
+    if cache_processes(processes):
+        raise RuntimeError("CACHE_ALREADY_RUNNING: use cache-stop first; no duplicate launch")
+    if size_gib <= 0:
+        raise ValueError("cache size must be positive")
+    check_cache_budget(size_gib)
+    check_cache_ports()
+    environment = ROOT / "env.sh"
+    if not environment.is_file():
+        raise FileNotFoundError(environment)
+    command = ["bash", "-c",
+        'set -e; source "$1"; unset LMCACHE_ASCEND_PP_STAGE_LOCAL; shift; exec lmcache server "$@"',
+        "pp-cache", str(environment), "--host", "0.0.0.0", "--port", "5565",
+        "--http-host", "127.0.0.1", "--http-port", "15565", "--chunk-size", "512",
+        "--supported-transfer-mode", "lmcache_driven", "--l1-size-gb", str(size_gib),
+        "--eviction-policy", "LRU", "--l1-align-bytes", "65536", "--disable-metrics",
+        "--max-gpu-workers", "1", "--enable-extra-logging", "--extra-logging-interval", "10"]
+    logs = ROOT / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    log = logs / f"lmcache-{stamp}-{os.getpid()}.log"
+    with log.open("xb") as output:
+        child = subprocess.Popen(command, cwd=Path.cwd(), stdin=subprocess.DEVNULL,
+            stdout=output, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
+    (ROOT / "cache-size-gib.txt").write_text(str(size_gib) + "\n", encoding="utf-8")
+    (logs / "cache-process.json").write_text(json.dumps({
+        "pid": child.pid, "log": str(log), "size_gib": size_gib, "state": "submitted"
+    }) + "\n", encoding="utf-8")
+    print(f"CACHE_SUBMITTED PID={child.pid} LOG={log}", flush=True)
+    wait_cache_ready(child.pid, size_gib, ready_timeout, log)
 
 
 def start_model() -> None:
@@ -218,6 +388,18 @@ def print_status() -> None:
     print("CACHE_PIDS", sorted(caches))
     print("WATCHER_PIDS", sorted(watchers))
     print("LAST_LAUNCH", read_receipt())
+    try:
+        state = cache_status()
+        managers = state.get("storage_manager", {}).get("l1_managers", {})
+        print("CACHE_HEALTHY", state.get("is_healthy"), "POOL_GIB",
+              sum(p.get("memory_configured_bytes", 0) for p in managers.values()) / (1 << 30),
+              "REGISTERED_WORKERS", len(state.get("registered_gpu_ids", [])))
+    except (OSError, ValueError) as error:
+        print("CACHE_STATUS_UNAVAILABLE", str(error))
+    try:
+        print("CACHE_LAST_LAUNCH", json.loads((ROOT / "logs/cache-process.json").read_text()))
+    except (OSError, ValueError):
+        pass
 
 
 def read_receipt() -> dict[str, object]:
@@ -230,16 +412,18 @@ def read_receipt() -> dict[str, object]:
 
 
 def main() -> None:
-    """Run a container-local model action while preserving cache and capture."""
+    """Run one explicit model/cache action; never control the observer."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("status", "stop", "start", "restart"))
+    parser.add_argument("action", choices=("status", "stop", "start", "restart", "cache-stop", "cache-start"))
     parser.add_argument("--timeout", type=float, default=20)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--size-gib", type=int, default=1024)
+    parser.add_argument("--ready-timeout", type=float, default=600)
     args = parser.parse_args()
     if os.name != "posix" or not Path("/proc/self/stat").exists():
         parser.error("run inside the customer Linux container")
-    if args.timeout <= 0:
-        parser.error("--timeout must be positive")
+    if min(args.timeout, args.ready_timeout, args.size_gib) <= 0:
+        parser.error("timeouts and size must be positive")
     if args.action == "status":
         print_status()
         return
@@ -251,11 +435,15 @@ def main() -> None:
             stop_models(args.timeout, args.force)
         if args.action in ("start", "restart"):
             start_model()
+        if args.action == "cache-stop":
+            stop_cache(args.timeout, args.force)
+        if args.action == "cache-start":
+            start_cache(args.size_gib, args.ready_timeout)
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as error:
-        print("MODEL_ACTION_FAILED:", str(error), file=sys.stderr)
+        print("PP_ACTION_FAILED:", str(error), file=sys.stderr)
         raise SystemExit(1)

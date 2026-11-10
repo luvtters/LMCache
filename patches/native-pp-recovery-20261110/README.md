@@ -88,3 +88,32 @@ and check health on 85. Cache and observer processes remain running. The model
 control checks cover ownership, PID reuse, wrapper/entry signaling, duplicate
 launch prevention and stale-registration rejection using CPU substitutes; no
 customer services were started or stopped during those checks.
+
+### DDR pool resize: stop models, replace caches, restart models
+
+`pp_model.py cache-stop` only stops the local explicit port-5565 LMCache CLI
+server, and refuses while any model is live. `cache-start --size-gib 1024`
+requires the old cache and model to exit, checks host/cgroup available RAM
+against the requested pool plus a minimum 64 GiB reserve, checks both cache
+ports, and starts the original `lmcache server` arguments. It changes the pool
+size and enables INFO extra statistics every 10 seconds; `--disable-metrics`
+and all other original cache settings remain. It saves the size to
+`cache-size-gib.txt`, records `logs/cache-process.json`, and only reports
+`CACHE_READY` after a healthy `/status` confirms the requested configured size.
+A readiness timeout preserves the cache process and reports its log path.
+These RAM checks are a startup budget check, not proof of peak memory usage.
+
+On **both** hosts first run `python3 pp_model.py stop --force` and wait for
+`MODEL_STOPPED`. Then on each run `python3 pp_model.py cache-stop --force`
+followed by `python3 pp_model.py cache-start --size-gib 1024`. Wait for both
+`CACHE_READY SIZE_GIB=1024` receipts. Finally run `python3 pp_model.py start`
+on 85, immediately followed by the same command on 86. Cache/model output is
+saved to new private logs, whose paths are printed. The existing `startpp.sh`,
+model flags and installed environment are unchanged. Cache restart discards
+the old volatile KV contents; a new cold fill is required before a hot round.
+
+`--force` first gives the selected service the normal graceful timeout, then
+signals only captured PID/start-time identities. Model worker identities stay
+tracked if they are reparented during shutdown. The 15 standalone CPU checks
+cover ownership, orphan shutdown, cgroup budgets, duplicate launches and exact
+cache readiness capacity; they do not allocate a 1 TiB pool or run NPU services.
