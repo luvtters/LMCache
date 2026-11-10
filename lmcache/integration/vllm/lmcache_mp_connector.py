@@ -1428,15 +1428,22 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         if tracker.lookup_started_at is None:
             tracker.lookup_started_at = time.monotonic()
-        self.scheduler_adapter.maybe_submit_lookup_request(
+        lookup_pending = self.scheduler_adapter.maybe_submit_lookup_request(
             request.request_id,
             token_ids=tracker.get_token_ids(),
             cache_salt=tracker.cache_salt,
             request_configs=tracker.request_configs,
             reserve_last_token=self._reserve_last_token_for_lookup,
+            resume_existing_session=(
+                getattr(self, "_read_policy", "legacy") == "transfer_borrow"
+                and request.status == RequestStatus.PREEMPTED
+            ),
         )
 
-        ret = self.scheduler_adapter.check_lookup_result(request.request_id)
+        ret = (
+            0 if lookup_pending is False
+            else self.scheduler_adapter.check_lookup_result(request.request_id)
+        )
         if ret is None:
             return None, True
         assert tracker.lookup_started_at is not None

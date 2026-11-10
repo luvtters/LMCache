@@ -928,7 +928,8 @@ class LMCacheMPSchedulerAdapter:
         cache_salt: str = "",
         request_configs: dict[str, Any] | None = None,
         reserve_last_token: bool = False,
-    ) -> None:
+        resume_existing_session: bool = False,
+    ) -> bool:
         """
         Submit a new lookup request to LMCache if there is no ongoing request.
 
@@ -946,9 +947,12 @@ class LMCacheMPSchedulerAdapter:
                 the IPC key.
             reserve_last_token: Whether to exclude the final token before
                 aligning the lookup range.
+            resume_existing_session: Continue this same preempted request's
+                admitted session after its previous control RPCs have completed.
 
         Returns:
-            None
+            True if a lookup is pending; False if this call must use a local
+            miss without consulting results retained from an earlier lookup.
 
         Notes:
             This function will have a side-effect: submitting a look up request to
@@ -960,14 +964,22 @@ class LMCacheMPSchedulerAdapter:
         self._ensure_heartbeat_started()
 
         if not self.is_healthy:
-            return
-
-        if request_id in self._pending_lookups:
-            # Skip if there is already a lookup request
-            return
+            return False
 
         if get_read_policy() == "transfer_borrow":
-            self._check_lookup_reuse(request_id)
+            can_resume = self._check_lookup_reuse(
+                request_id, resume_existing_session=resume_existing_session
+            )
+            if not can_resume:
+                # The old generation contains control RPCs only. Preserve it
+                # for ordered END, but let this preempted request recompute.
+                return False
+
+        if request_id in self._pending_lookups:
+            # Skip if there is already a lookup request.
+            return True
+
+        if get_read_policy() == "transfer_borrow":
             if not hasattr(self, "_lookup_deadlines"):
                 self._lookup_deadlines = {}
             self._lookup_deadlines[request_id] = time.monotonic() + self._mq_timeout
@@ -1001,6 +1013,7 @@ class LMCacheMPSchedulerAdapter:
         )
         self._pending_lookups.add(request_id)
         self._lookup_params[request_id] = (token_ids, cache_salt, request_configs)
+        return True
 
     def _free_inconsistent_lookup_locks(
         self,
@@ -1197,12 +1210,17 @@ class LMCacheMPSchedulerAdapter:
         self._lookup_status.pop(request_id, None)
         return registry
 
-    def _check_lookup_reuse(self, request_id: str) -> None:
+    def _check_lookup_reuse(
+        self, request_id: str, *, resume_existing_session: bool = False
+    ) -> bool:
         if get_read_policy() != "transfer_borrow":
-            return
+            return True
         registry = getattr(self, "_lookup_control_registry", None)
         if registry is not None:
-            registry.check_reuse(request_id)
+            return registry.check_reuse(
+                request_id, resume_existing_session=resume_existing_session
+            )
+        return True
 
     def cleanup_lookup_result(self, request_id: str) -> None:
         """

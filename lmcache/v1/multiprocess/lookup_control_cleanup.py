@@ -116,12 +116,37 @@ class LookupControlRegistry:
             state = self._states[request_id]
         state.end()
 
-    def check_reuse(self, request_id: str) -> None:
+    def check_reuse(
+        self, request_id: str, *, resume_existing_session: bool = False
+    ) -> bool:
         with self._lock:
-            if request_id in self._states:
-                raise RuntimeError(
-                    f"Lookup request {request_id!r} has an unquiescent generation"
-                )
+            state = self._states.get(request_id)
+            if state is None:
+                return True
+            if resume_existing_session:
+                # Preemption continues the admitted request's live session.
+                # It may submit another LOOKUP only after every old control
+                # handler has returned successfully, and never after END began.
+                with state._lock:
+                    if not state.ending and not state.failed:
+                        dependencies = [
+                            future for futures in state.dependencies.values()
+                            for future in futures
+                        ]
+                        if all(future.query() for future in dependencies):
+                            try:
+                                for future in dependencies:
+                                    future.result(timeout=0)
+                            except Exception:
+                                pass
+                            else:
+                                return True
+                # Only a preempted request may fall back to local computation
+                # while its old lookup controls remain quarantined until END.
+                return False
+            raise RuntimeError(
+                f"Lookup request {request_id!r} has an unquiescent generation"
+            )
 
     def _retire(self, state: _Cleanup) -> None:
         with self._lock:
