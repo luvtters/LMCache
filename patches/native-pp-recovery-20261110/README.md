@@ -44,3 +44,27 @@ cache snapshot describes collection time, not the incident's memory pressure.
 
 This completion fix does not establish or repair the cause of missing cache
 keys, and does not change the 300-second read lock TTL or benchmark parameters.
+
+## Independent incident capture
+
+`python3 watch_pp.py start --node 85` (or `--node 86`) launches a detached
+standard-library-only capture process and returns only after its live PID and
+ready receipt are confirmed. `summary` works from a new terminal; `stop` writes
+only the collector's STOP file and waits for that collector, never sending a
+signal to the model/cache. It defaults to a two-hour maximum duration.
+
+The API node reads existing model metrics every 5 seconds; each node reads local
+cache status every 15 seconds, backing off if that management probe is slow.
+It records query-duration counter deltas, queues, cache locks/capacity, Linux
+process CPU/RSS/wait channels, and fresh exceptions from current logs. Existing
+logs begin at their current end; cache stdout regular files are discovered via
+the cache process. Log floods are bounded with skipped-byte counts. All raw
+samples and an atomically updated summary stay under `/opt/ks-luv-pp/watch`.
+
+This is aggregate diagnostic capture, not per-request RPC/lock instrumentation.
+It cannot establish lock acquisition age or split the lookup observation time
+into exact internal phases. Periodic status calls also have some overhead;
+record this as a diagnostic run rather than an uninstrumented performance run.
+The standalone capture checks exercise real detached start, duplicate-start
+rejection, HTTP sampling, fresh-log-only capture, flood bounds, summary/stop,
+and a fixed old-log snapshot. They do not start any inference/device process.
