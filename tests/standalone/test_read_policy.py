@@ -61,6 +61,16 @@ class ReadPolicyTest(unittest.TestCase):
         ns['confirm_borrowed_restore'](tracker, 0, 512)
         self.assertEqual(tracker.num_stored_tokens, 0)  # failed load/recompute
 
+        # A failed load can retain a valid local APC prefix. Its old external
+        # hint must not make GetStoreMetadata count uncomputed KV as available.
+        tracker.borrowed_restore_submitted = True
+        tracker.num_lmcache_hit_tokens = 8192
+        tracker.num_vllm_hit_tokens = 1024
+        ns['confirm_borrowed_restore'](tracker, 1024, 512)
+        self.assertEqual(tracker.num_lmcache_hit_tokens, 0)
+        self.assertEqual(tracker.num_vllm_hit_tokens, 1024)
+        self.assertEqual(tracker.num_stored_tokens, 0)
+
 
 if __name__ == '__main__':
     unittest.main()

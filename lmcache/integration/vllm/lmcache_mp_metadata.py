@@ -152,6 +152,16 @@ class LMCacheMPRequestTracker:
         """
         if not self.borrowed_restore_submitted:
             return
+        if num_computed_tokens < self.num_lmcache_hit_tokens - 1:
+            # Recovery may retain a nonzero local APC prefix, in which case
+            # vLLM schedules recomputation without calling lookup again. Drop
+            # the old external hint before GetStoreMetadata adds scheduled
+            # tokens to it; otherwise it can store KV not computed yet.
+            self.num_lmcache_hit_tokens = 0
+            self.num_vllm_hit_tokens = max(0, num_computed_tokens)
+            self.num_stored_tokens = 0
+            self.borrowed_restore_submitted = False
+            return
         confirmed = min(
             self.num_lmcache_hit_tokens,
             num_computed_tokens // chunk_size * chunk_size,
