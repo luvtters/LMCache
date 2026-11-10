@@ -6,6 +6,7 @@ import threading
 
 # First Party
 from lmcache import torch_dev
+from lmcache.logging import init_logger
 from lmcache.utils import lmcache_deprecate
 from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
 from lmcache.v1.platform.base.event_ipc import (
@@ -14,6 +15,7 @@ from lmcache.v1.platform.base.event_ipc import (
 )
 
 T = TypeVar("T")
+logger = init_logger(__name__)
 
 
 class MessagingStream(Iterator[T]):
@@ -62,6 +64,46 @@ class MessagingFuture(Generic[T]):
         self.result_: T | None = None
         self.exception_: BaseException | None = None
         self._retained_references: list[object] = []
+        self._completion_lock = threading.Lock()
+        self._done_callbacks: list[Callable[["MessagingFuture[T]"], None]] = []
+
+    def add_done_callback(
+        self, callback: Callable[["MessagingFuture[T]"], None]
+    ) -> None:
+        """Invoke ``callback(self)`` once for this registration on completion.
+
+        An already completed future invokes the callback synchronously here;
+        otherwise the completing thread invokes it. The terminal state is
+        published first and callbacks run outside the completion lock. Callbacks
+        must not block the transport thread. Their failures are logged without
+        preventing other callbacks from running.
+        """
+        with self._completion_lock:
+            if not self.is_done_.is_set():
+                self._done_callbacks.append(callback)
+                return
+        self._invoke_done_callback(callback)
+
+    def _invoke_done_callback(
+        self, callback: Callable[["MessagingFuture[T]"], None]
+    ) -> None:
+        try:
+            callback(self)
+        except BaseException:
+            # A callback must not terminate the shared transport poller, even
+            # if it raises SystemExit, or prevent subsequent callbacks.
+            logger.exception("MessagingFuture completion callback failed")
+
+    def _complete(self, result: T | None, exception: BaseException | None) -> None:
+        with self._completion_lock:
+            if self.is_done_.is_set():
+                return
+            self.result_ = result
+            self.exception_ = exception
+            self.is_done_.set()
+            callbacks, self._done_callbacks = self._done_callbacks, []
+        for callback in callbacks:
+            self._invoke_done_callback(callback)
 
     def query(self) -> bool:
         """
@@ -137,8 +179,7 @@ class MessagingFuture(Generic[T]):
         Args:
             result (T): The result to set.
         """
-        self.result_ = result
-        self.is_done_.set()
+        self._complete(result, None)
 
     def set_exception(self, exception: BaseException) -> None:
         """Set a request exception and mark this future as complete.
@@ -151,8 +192,7 @@ class MessagingFuture(Generic[T]):
         Args:
             exception: Failure raised while processing the request.
         """
-        self.exception_ = exception
-        self.is_done_.set()
+        self._complete(None, exception)
 
     def retain_reference(self, value: object) -> None:
         """Keep a resource alive for at least the lifetime of this future.
@@ -240,6 +280,15 @@ class DeviceMessagingFuture(MessagingFuture[T]):
             event_backend = get_event_ipc_backend(self.device_)
             event_backend.check_event_support(self.device_)
         self._event_backend = event_backend
+
+    def add_done_callback(
+        self, callback: Callable[["MessagingFuture[T]"], None]
+    ) -> None:
+        """Reject callbacks because raw RPC completion is not device completion."""
+        raise NotImplementedError(
+            "DeviceMessagingFuture callbacks require device completion tracking; "
+            "use query() or device events instead"
+        )
 
     def _on_raw_future_complete(self) -> None:
         """
