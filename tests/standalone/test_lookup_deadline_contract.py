@@ -106,6 +106,27 @@ class LookupDeadlineTest(unittest.TestCase):
         self.assertEqual(obj._finished_lookup_results["r"], 12)
         self.assertEqual(obj.timed_out, [])
 
+    def test_late_first_poll_after_ack_preserves_server_health(self):
+        obj, clock, _ = scheduler()
+        marker = methods(
+            "lmcache/integration/vllm/vllm_multi_process_adapter.py",
+            "LMCacheMPSchedulerAdapter", {"_mark_lookup_timed_out"},
+            {"logger": logging.getLogger("lookup-contract")},
+        )
+        # Run the real health mutation rather than the fixture's recorder.
+        obj._mark_lookup_timed_out = marker._mark_lookup_timed_out.__get__(obj)
+        obj._health_events["server"].set()
+        obj._unacked_lookups["r"] = SimpleNamespace(
+            futures={"server": Reply(True)}, submitted_at=0.0
+        )
+        # ACK is complete. Only the scheduler's first revisit is late; no
+        # STATUS request was sent, so there is no evidence of an RPC timeout.
+        clock.now = 8.0
+        self.assertEqual(obj.check_lookup_result("r"), 0)
+        self.assertEqual(obj.requests, [])
+        self.assertNotIn("r", obj._unacked_lookups)
+        self.assertTrue(obj._health_events["server"].is_set())
+
     def test_ack_timeout_uses_total_budget_and_retains_pending_dependency(self):
         obj, clock, _ = scheduler()
         reply = Reply(ready=False)

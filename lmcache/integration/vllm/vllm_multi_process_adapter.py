@@ -1116,7 +1116,8 @@ class LMCacheMPSchedulerAdapter:
             # Keep the same future until its reply arrives; never restart a poll.
             if url not in futures:
                 if deadline is not None and time.monotonic() >= deadline:
-                    self._mark_lookup_timed_out(url)
+                    # The local lookup budget expired before sending STATUS.
+                    # No outstanding RPC here establishes server failure.
                     return 0
                 futures[url] = (
                     self.req_clients[url].query_prefetch_status(request_id),
