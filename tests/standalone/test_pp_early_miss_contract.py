@@ -31,6 +31,17 @@ def stages(enabled=True):
 
 
 class EarlyMissTest(unittest.TestCase):
+    def test_original_ack_wait_is_observed_when_fastpath_disabled(self):
+        obj, clock = stages(enabled=False)
+        records = []
+        obj._pp_lookup_observer = SimpleNamespace(record=lambda name, value=1: records.append((name, value)))
+        obj._unacked_lookups["r"] = SimpleNamespace(
+            futures={"early": Reply(ready=False), "late": Reply(ready=False)},
+            submitted_at=0.0,
+        )
+        self.assertIsNone(obj.check_lookup_result("r"))
+        self.assertIn(("pending_ack", 2), records)
+
     def test_invalid_config_does_not_create_transport_clients(self):
         source = "lmcache/integration/vllm/vllm_multi_process_adapter.py"
         tree = ast.parse((Path(__file__).resolve().parents[2] / source).read_text(encoding="utf-8"))

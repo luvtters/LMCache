@@ -1182,10 +1182,10 @@ class LMCacheMPSchedulerAdapter:
                         del self._unacked_lookups[request_id]
                     return 0
                 # Acknowledgement still in flight; poll again next step.
-                if not self._pp_query_fastpath:
-                    return None
                 if observer is not None:
                     observer.record("pending_ack", len(ack.futures))
+                if not self._pp_query_fastpath:
+                    return None
             else:
                 del self._unacked_lookups[request_id]
 
@@ -2167,7 +2167,8 @@ class LMCacheMPWorkerAdapter:
         )
         self.store_futures[request_id] = future
         observer = getattr(self, "_pp_wait_observer", None)
-        if observer is not None:
+        if (observer is not None and not self.lazy_offload
+                and get_read_policy() == "transfer_borrow"):
             submitted = observer.store_submitted(request_id)
             raw_future = getattr(future, "raw_future_", future)
             raw_future.add_done_callback(

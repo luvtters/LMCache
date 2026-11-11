@@ -9,6 +9,7 @@ from pathlib import Path
 import threading
 from types import SimpleNamespace as NS
 import unittest
+from concurrent.futures import Future
 
 from test_lookup_deadline_contract import methods
 
@@ -29,6 +30,35 @@ class RecordingObserver:
 
 
 class StoreWaitObserveTest(unittest.TestCase):
+    def test_store_spans_are_limited_to_eager_transfer_borrow(self):
+        for policy, lazy, expected in (("legacy", False, 0),
+                                       ("transfer_borrow", True, 0),
+                                       ("transfer_borrow", False, 1)):
+            cls = methods(
+                "lmcache/integration/vllm/vllm_multi_process_adapter.py",
+                "LMCacheMPWorkerAdapter", {"submit_store_request"},
+                {"get_read_policy": lambda: policy},
+            )
+            obj = cls()
+            obj._pp_wait_observer = observer_module.PPWaitObserver("store", "pp0")
+            obj.is_kv_writer, obj.is_healthy, obj.lazy_offload = True, True, lazy
+            obj._ensure_heartbeat_started = lambda: None
+            obj._create_key = lambda *a, **kw: "key"
+            obj._block_ids_per_group = lambda op: [[1]]
+            future = Future()
+            calls = []
+            def submit(*args):
+                calls.append(args)
+                return future
+            obj.transfer_ctx = NS(submit_store=submit)
+            obj.kv_caches, obj.blocks_in_chunk = {}, 1
+            obj.store_futures, obj.store_events = {}, {}
+            obj._kv_events_enabled = False
+            obj.submit_store_request("r", NS(token_ids=[1], start=0, end=1), None)
+            self.assertEqual(len(calls), 1)
+            counts = obj._pp_wait_observer.snapshot()
+            self.assertEqual(counts.get("store_submitted", (0,))[0], expected)
+
     def test_tracked_count_does_not_query_or_drain_store_handles(self):
         cls = methods(
             "lmcache/v1/multiprocess/transfer_context/worker_transfer.py",

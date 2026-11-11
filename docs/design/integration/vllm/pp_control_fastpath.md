@@ -49,7 +49,9 @@ It adds no thread, device query, or synchronization. Observations include:
 Actual native block release is `NOT_OBSERVED`. Device readiness is a host-observed
 upper bound, not a physical DMA timestamp. No cross-process time subtraction is
 used. STORE frequency, flush timeout, synchronization, and free conditions are
-unchanged. No STORE policy optimization is included.
+unchanged. Per-request STORE spans are collected only for eager
+`transfer_borrow`; legacy and lazy offload do not create span state. No STORE
+policy optimization is included.
 
 CPU wire tests use actual ZMQ queues/codecs/futures and controlled CPU handlers;
 they substitute the device cache-key payload and exclude device/IPC encoders.
