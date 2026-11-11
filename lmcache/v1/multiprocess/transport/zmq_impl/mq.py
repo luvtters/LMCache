@@ -235,7 +235,7 @@ class ClientPollingLoop:
                     logger.debug("Registered client socket %s", op.client.socket)
                 elif op.kind is _OpKind.UNREGISTER:
                     op.client.cancel_streams()
-                    op.client.process_outbound_task()
+                    op.client.process_outbound_task(max_tasks=0)
                     self._poller.unregister(op.client.socket)
                     self._socket_to_client.pop(op.client.socket, None)
                     self._poller.unregister(op.client.monitor)
@@ -306,7 +306,12 @@ class MessageQueueClient:
         request_payloads: list[Any]
         responses: queue.Queue | None = None
 
-    def __init__(self, server_url: str, context: zmq.Context):
+    def __init__(
+        self, server_url: str, context: zmq.Context, *, outbound_batch_limit: int = 0
+    ):
+        if outbound_batch_limit < 0:
+            raise ValueError("outbound_batch_limit must be nonnegative")
+        self.outbound_batch_limit = outbound_batch_limit
         # Socket
         self.ctx = context
         self.socket = self.ctx.socket(zmq.DEALER)
@@ -329,9 +334,19 @@ class MessageQueueClient:
         self._polling_loop = ClientPollingLoop.get_instance()
         self._polling_loop.register(self)
 
-    def process_outbound_task(self):
+    def process_outbound_task(self, *, max_tasks: int | None = None):
+        """Send a FIFO batch; zero preserves unlimited draining on close.
+
+        Every dequeued request or control frame consumes one budget slot.
+        """
+        limit = self.outbound_batch_limit if max_tasks is None else max_tasks
+        if limit < 0:
+            raise ValueError("max_tasks must be nonnegative")
+        processed = 0
         try:
-            while wrapped_request := self.input_queue.get_nowait():
+            while not limit or processed < limit:
+                wrapped_request = self.input_queue.get_nowait()
+                processed += 1
                 if isinstance(wrapped_request, list):
                     self.socket.send_multipart(wrapped_request)
                     if wrapped_request[-1] == b"cancel":
@@ -393,6 +408,10 @@ class MessageQueueClient:
                         wrapped_request.future.set_exception(exc)
         except queue.Empty:
             pass
+
+        # Residual work must remain runnable even when producers are idle.
+        if limit and processed == limit:
+            self._polling_loop.notify()
 
     def process_inbound(self) -> None:
         """Process one inbound response from the server.
