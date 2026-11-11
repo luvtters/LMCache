@@ -2,9 +2,11 @@
 """CPU contracts executing the real scheduler methods without device imports."""
 
 import unittest
+import time
 from types import SimpleNamespace
 
-from test_lookup_deadline_contract import Reply, scheduler
+from test_lookup_deadline_contract import Reply, methods, scheduler
+from test_preempted_lookup_contract import Reply as FutureReply, adapter, connector
 
 
 def stages(enabled=True):
@@ -26,6 +28,121 @@ def stages(enabled=True):
 
 
 class EarlyMissTest(unittest.TestCase):
+    def test_pending_ack_does_not_renew_deadline(self):
+        obj, clock = stages()
+        pending = Reply(ready=False)
+        obj.replies["early"] = Reply(3)
+        obj._unacked_lookups["r"] = SimpleNamespace(
+            futures={"early": Reply(None), "late": pending}, submitted_at=0.0
+        )
+        self.assertIsNone(obj.check_lookup_result("r"))
+        clock.now = 5.1
+        self.assertEqual(obj.check_lookup_result("r"), 0)
+        self.assertEqual(obj.timed_out, ["late"])
+        self.assertIs(obj._unacked_lookups["r"].futures["late"], pending)
+        self.assertEqual(obj._lookup_deadlines["r"], 5.0)
+        self.assertNotIn("r", obj._finished_lookup_results)
+
+    def test_early_miss_admission_cleanup_then_end_waits_for_own_ack(self):
+        obj = adapter()
+        obj._pp_query_fastpath = True
+        obj._finished_lookup_results.clear()
+        obj._per_server_hits.clear()
+        ready, pending, zero = FutureReply(), FutureReply(), FutureReply()
+        ready.set_result(None)
+        zero.set_result(0)
+        obj._unacked_lookups["request"] = SimpleNamespace(
+            futures={"stage0": ready, "stage1": pending},
+            submitted_at=time.monotonic(),
+        )
+        obj.req_clients["stage0"].query_prefetch_status = lambda rid: zero
+        con = connector(obj)
+        con.request_trackers["request"] = SimpleNamespace(
+            state="PREFETCHING", lookup_started_at=time.monotonic(),
+            get_token_ids=lambda: [], cache_salt="", request_configs=None,
+            num_allocated_blocks=lambda: {}, num_lmcache_hit_tokens=0,
+        )
+        request = SimpleNamespace(request_id="request", status="RUNNING")
+        self.assertEqual(con.get_num_new_matched_tokens(request, 0), (0, False))
+        alloc = methods(
+            "lmcache/integration/vllm/lmcache_mp_connector.py",
+            "LMCacheMPConnector", {"update_state_after_alloc"}, {
+                "LMCacheMPRequestState": SimpleNamespace(
+                    READY="READY", PREFETCHING="PREFETCHING", BYPASS_LMCACHE="BYPASS"
+                )
+            },
+        )
+        con._get_request_tracker = lambda rid: con.request_trackers[rid]
+        alloc.update_state_after_alloc(
+            con, request, SimpleNamespace(get_block_ids=lambda: ()), 0
+        )
+        self.assertEqual(con.request_trackers["request"].state, "READY")
+        self.assertEqual(obj.ends, {})
+        self.assertEqual(obj.sent, [])
+        self.assertFalse(obj._check_lookup_reuse(
+            "request", resume_existing_session=True
+        ))
+        obj.end_session("request")
+        self.assertEqual(set(obj.ends), {"stage0"})
+        pending.set_result(None)
+        self.assertEqual(set(obj.ends), {"stage0", "stage1"})
+        with self.assertRaises(RuntimeError):
+            obj._check_lookup_reuse("request")
+        for future in obj.ends.values():
+            future.set_result(None)
+        self.assertTrue(obj._check_lookup_reuse("request"))
+
+    def test_ack_exception_is_not_cached_as_final_miss(self):
+        obj, _ = stages()
+        broken = FutureReply()
+        broken.set_exception(ConnectionError("unknown delivery"))
+        obj._unacked_lookups["r"] = SimpleNamespace(
+            futures={"early": broken}, submitted_at=0.0
+        )
+        with self.assertRaises(ConnectionError):
+            obj.check_lookup_result("r")
+        self.assertNotIn("r", obj._finished_lookup_results)
+        self.assertIs(obj._unacked_lookups["r"].futures["early"], broken)
+        self.assertEqual(obj.sent, [])
+
+    def test_disabled_preserves_all_ack_barrier(self):
+        obj, _ = stages(enabled=False)
+        obj._unacked_lookups["r"] = SimpleNamespace(
+            futures={"early": Reply(None), "late": Reply(ready=False)},
+            submitted_at=0.0,
+        )
+        self.assertIsNone(obj.check_lookup_result("r"))
+        self.assertEqual(obj.sent, [])
+
+    def test_own_ack_allows_status_while_peer_ack_is_pending(self):
+        obj, _ = stages()
+        pending = Reply(ready=False)
+        obj._unacked_lookups["r"] = SimpleNamespace(
+            futures={"early": Reply(None), "late": pending}, submitted_at=1.25
+        )
+        self.assertEqual(obj.check_lookup_result("r"), 0)
+        self.assertEqual(obj.sent, [("early", "r")])
+        self.assertIs(obj._unacked_lookups["r"].futures["late"], pending)
+        self.assertEqual(obj._unacked_lookups["r"].submitted_at, 1.25)
+        self.assertEqual(obj._lookup_deadlines["r"], 5.0)
+
+    def test_empty_ack_is_not_a_miss_and_status_is_not_duplicated(self):
+        obj, _ = stages()
+        pending = Reply(ready=False)
+        obj.replies["early"] = Reply(3, ready=False)
+        obj._unacked_lookups["r"] = SimpleNamespace(
+            futures={"early": Reply(None), "late": pending}, submitted_at=0.0
+        )
+        self.assertIsNone(obj.check_lookup_result("r"))
+        self.assertIsNone(obj.check_lookup_result("r"))
+        self.assertEqual(obj.sent, [("early", "r")])
+        pending.ready = True
+        obj.replies["late"].ready = True
+        self.assertIsNone(obj.check_lookup_result("r"))
+        obj.replies["early"].ready = True
+        self.assertEqual(obj.check_lookup_result("r"), 8)
+        self.assertEqual(obj.sent, [("early", "r"), ("late", "r")])
+
     def test_final_zero_does_not_wait_for_peer(self):
         obj, _ = stages()
         self.assertEqual(obj.check_lookup_result("r"), 0)

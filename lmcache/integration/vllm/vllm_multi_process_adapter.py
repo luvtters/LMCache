@@ -258,7 +258,7 @@ class _LookupAck:
 
     ``LMCacheMPSchedulerAdapter.maybe_submit_lookup_request`` sends one LOOKUP
     per server and returns without waiting for the reply.  The futures are
-    kept here so that ``check_lookup_result`` can confirm every server has
+    kept here so that ``check_lookup_result`` can confirm the relevant server
     registered the prefetch job before it sends QUERY_PREFETCH_STATUS, and so
     a reply that never arrives can be detected via ``submitted_at``.
     """
@@ -780,8 +780,8 @@ class LMCacheMPSchedulerAdapter:
         # Lookup state tracking:
         # - _pending_lookups: request_ids submitted but not yet resolved
         # - _unacked_lookups: LOOKUP futures not yet acknowledged by every
-        #   server. check_lookup_result never sends QUERY_PREFETCH_STATUS for
-        #   a request until its LOOKUP has been acked (see _LookupAck).
+        #   server. STATUS follows all ACKs by default, or its endpoint's ACK
+        #   with the opt-in PP fastpath (see _LookupAck).
         # - _finished_lookup_results: cached chunk count keyed by request_id,
         #   so that repeated calls to check_lookup_result return the same value
         #   even after the server has already popped the job (exactly-once).
@@ -1086,6 +1086,8 @@ class LMCacheMPSchedulerAdapter:
         With ``lmcache.mp.pp_query_fastpath`` enabled, a consumed final integer
         zero establishes an empty common prefix immediately. Outstanding peer
         controls remain owned until normal request cleanup and session end.
+        Each stage may submit STATUS after its own successful LOOKUP ACK;
+        positive results still require final STATUS from every stage.
 
         First polls, without blocking, whether every server has acknowledged
         the LOOKUP sent by ``maybe_submit_lookup_request``; while any ack is
@@ -1130,10 +1132,20 @@ class LMCacheMPSchedulerAdapter:
             # LOOKUP and QUERY_PREFETCH_STATUS run on the same server thread
             # pool and may be reordered, and a status query for an unknown
             # request_id answers 0: a spurious miss whose prefetch locks are
-            # never released. So never query until every server has acked.
-            ack.futures = {
-                url: fut for url, fut in ack.futures.items() if not fut.query()
-            }
+            # never released. Each STATUS must follow its own successful ACK.
+            if self._pp_query_fastpath:
+                for url, fut in list(ack.futures.items()):
+                    if fut.query():
+                        try:
+                            fut.result(timeout=0)
+                        except TimeoutError:
+                            self._mark_lookup_timed_out(url)
+                            return 0
+                        del ack.futures[url]
+            else:
+                ack.futures = {
+                    url: fut for url, fut in ack.futures.items() if not fut.query()
+                }
             if ack.futures:
                 if (time.monotonic() >= deadline if deadline is not None else
                         time.monotonic() - ack.submitted_at >= self._mq_timeout):
@@ -1143,14 +1155,18 @@ class LMCacheMPSchedulerAdapter:
                         del self._unacked_lookups[request_id]
                     return 0
                 # Acknowledgement still in flight; poll again next step.
-                return None
-            del self._unacked_lookups[request_id]
+                if not self._pp_query_fastpath:
+                    return None
+            else:
+                del self._unacked_lookups[request_id]
 
         # Persistent accumulator for this request. A server present in
         # the dict has already handed over its final hit count and must
         # not be polled again; absence means "not yet observed".
         per_server = self._per_server_hits.setdefault(request_id, {})
         unresolved_urls = [u for u in self._server_urls if u not in per_server]
+        if self._pp_query_fastpath and ack is not None:
+            unresolved_urls = [u for u in unresolved_urls if u not in ack.futures]
 
         futures = self._lookup_status.setdefault(request_id, {})
         for url in unresolved_urls:
