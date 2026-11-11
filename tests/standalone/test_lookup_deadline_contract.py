@@ -68,6 +68,7 @@ def scheduler(nonblocking=True):
     obj.is_healthy = True
     obj._mq_timeout = 5.0
     obj._nonblocking_lookup_status = nonblocking
+    obj._pp_query_fastpath = False
     obj.lmcache_tokens_per_chunk = 4
     obj.timed_out = []
     obj._mark_lookup_timed_out = lambda url: obj.timed_out.append(url)

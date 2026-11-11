@@ -60,6 +60,7 @@ def adapter(policy='transfer_borrow'):
     obj.lmcache_tokens_per_chunk = 512
     obj._mq_timeout = 10
     obj._nonblocking_lookup_status = True
+    obj._pp_query_fastpath = False
     obj.tp_size = 16
     obj._create_key = lambda *a, **kw: NS(no_worker_id_version=lambda: 'key')
     return obj

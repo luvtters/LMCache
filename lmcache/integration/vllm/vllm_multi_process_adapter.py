@@ -136,6 +136,8 @@ class ExtraConfigDefault(enum.Enum):
     heartbeat_interval = 10.0
     # Poll status replies without blocking the scheduler by default.
     nonblocking_lookup_status = True
+    # Experimental stage-local PP lookup path; deployment is L1-only.
+    pp_query_fastpath = False
     # Routing mode for ``create_transfer_context``: ``auto`` resolves to
     # the device spec's declared default (derived from
     # ``is_lmcache_driven_available()``: CUDA and NPU -> lmcache_driven;
@@ -723,6 +725,14 @@ class LMCacheMPSchedulerAdapter:
                 ``lmcache.mp.`` (e.g., ``lmcache.mp.mq_timeout``). When
                 provided, it overrides ``mq_timeout`` / ``heartbeat_interval``.
             pp_stage_locators: Ordered stage identities for the native PP layout.
+
+        Raises:
+            ValueError: If the opt-in PP query fastpath is used outside its
+                stage-local, transfer-borrow, nonblocking configuration.
+
+        Note:
+            ``lmcache.mp.pp_query_fastpath`` defaults to False. Experimental
+            deployments must use L1-only storage.
         """
         (
             vllm_block_size,
@@ -744,6 +754,7 @@ class LMCacheMPSchedulerAdapter:
         self._nonblocking_lookup_status = (
             ExtraConfigDefault.nonblocking_lookup_status.default
         )
+        self._pp_query_fastpath = ExtraConfigDefault.pp_query_fastpath.default
         if extra_config is not None:
             cfg = _resolve_extra_config(extra_config)
             mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
@@ -751,6 +762,19 @@ class LMCacheMPSchedulerAdapter:
             self._nonblocking_lookup_status = cfg[
                 ExtraConfigDefault.nonblocking_lookup_status.name
             ]
+            self._pp_query_fastpath = cfg[ExtraConfigDefault.pp_query_fastpath.name]
+        if self._pp_query_fastpath and not (
+            parallel_strategy.pp_stage_local
+            and parallel_strategy.pp_size > 1
+            and len(server_urls) == parallel_strategy.pp_size
+            and len(set(server_urls)) == len(server_urls)
+            and get_read_policy() == "transfer_borrow"
+            and self._nonblocking_lookup_status
+        ):
+            raise ValueError(
+                "pp_query_fastpath requires stage-local PP>1, one distinct server "
+                "per stage, transfer_borrow and nonblocking STATUS; deploy L1-only"
+            )
         self._mq_timeout = mq_timeout
 
         # Lookup state tracking:
@@ -1059,6 +1083,10 @@ class LMCacheMPSchedulerAdapter:
         """
         Check the result of a previously submitted lookup request.
 
+        With ``lmcache.mp.pp_query_fastpath`` enabled, a consumed final integer
+        zero establishes an empty common prefix immediately. Outstanding peer
+        controls remain owned until normal request cleanup and session end.
+
         First polls, without blocking, whether every server has acknowledged
         the LOOKUP sent by ``maybe_submit_lookup_request``; while any ack is
         outstanding this returns None. Once all servers have acked, polls one
@@ -1167,6 +1195,11 @@ class LMCacheMPSchedulerAdapter:
                     return 0
                 continue
             per_server[url] = int(r)
+            if self._pp_query_fastpath and type(r) is int and r == 0:
+                # The common prefix is empty regardless of outstanding peers.
+                # Keep their controls for normal request-end ordering.
+                self._finished_lookup_results[request_id] = 0
+                return 0
 
         if len(per_server) < len(self._server_urls):
             return None
