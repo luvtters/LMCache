@@ -3,6 +3,9 @@
 
 import unittest
 import time
+import ast
+import enum
+from pathlib import Path
 from types import SimpleNamespace
 
 from test_lookup_deadline_contract import Reply, methods, scheduler
@@ -28,6 +31,31 @@ def stages(enabled=True):
 
 
 class EarlyMissTest(unittest.TestCase):
+    def test_invalid_config_does_not_create_transport_clients(self):
+        source = "lmcache/integration/vllm/vllm_multi_process_adapter.py"
+        tree = ast.parse((Path(__file__).resolve().parents[2] / source).read_text(encoding="utf-8"))
+        defaults = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ExtraConfigDefault")
+        namespace = {"enum": enum, "Any": object}
+        exec(compile(ast.Module(body=[defaults], type_ignores=[]), source, "exec"), namespace)
+        config = namespace["ExtraConfigDefault"]
+        created = []
+        strategy = SimpleNamespace(pp_stage_local=False, pp_size=1)
+        cls = methods(source, "LMCacheMPSchedulerAdapter", {"__init__"}, {
+            "ExtraConfigDefault": config,
+            "DEFAULT_MQ_TIMEOUT": 300.0,
+            "DEFAULT_HEARTBEAT_INTERVAL": 10.0,
+            "_normalize_adapter_init_args": lambda *a: (16, strategy, 10, False),
+            "_resolve_extra_config": lambda extra: {
+                item.name: (True if item.name == "pp_query_fastpath" else item.default)
+                for item in config
+            },
+            "RequestClientFactory": SimpleNamespace(create=lambda *a, **k: created.append(a)),
+            "get_read_policy": lambda: "transfer_borrow",
+        })
+        with self.assertRaises(ValueError):
+            cls(["tcp://invalid:1"], object(), "model", 16, strategy, extra_config={})
+        self.assertEqual(created, [])
+
     def test_pending_ack_does_not_renew_deadline(self):
         obj, clock = stages()
         pending = Reply(ready=False)

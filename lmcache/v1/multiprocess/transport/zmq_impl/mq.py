@@ -10,6 +10,7 @@ import inspect
 import itertools
 import queue
 import threading
+import time
 
 # Third Party
 from zmq.utils.monitor import recv_monitor_message
@@ -30,6 +31,10 @@ from lmcache.v1.multiprocess.futures import (
     MessagingStream,
 )
 from lmcache.v1.multiprocess.request_handler import HandlerType
+from lmcache.v1.multiprocess.pp_wait_observer import (
+    PPWaitObserver,
+    create_pp_wait_observer,
+)
 from lmcache.v1.multiprocess.rpc import RpcOperation, RpcSpec, get_rpc_spec
 from lmcache.v1.multiprocess.transport.base import RequestServer
 from lmcache.v1.multiprocess.transport.zmq_impl.wire import (
@@ -308,7 +313,17 @@ class MessageQueueClient:
 
     def __init__(
         self, server_url: str, context: zmq.Context, *, outbound_batch_limit: int = 0
-    ):
+    ) -> None:
+        """Connect a client with an optional per-turn FIFO send budget.
+
+        Args:
+            server_url: ZMQ endpoint.
+            context: Shared ZMQ context.
+            outbound_batch_limit: Frames per turn; zero drains all frames.
+
+        Raises:
+            ValueError: If the budget is negative.
+        """
         if outbound_batch_limit < 0:
             raise ValueError("outbound_batch_limit must be nonnegative")
         self.outbound_batch_limit = outbound_batch_limit
@@ -334,10 +349,17 @@ class MessageQueueClient:
         self._polling_loop = ClientPollingLoop.get_instance()
         self._polling_loop.register(self)
 
-    def process_outbound_task(self, *, max_tasks: int | None = None):
+    def process_outbound_task(self, *, max_tasks: int | None = None) -> None:
         """Send a FIFO batch; zero preserves unlimited draining on close.
 
         Every dequeued request or control frame consumes one budget slot.
+
+        Args:
+            max_tasks: Override the client budget; None uses its configuration,
+                and zero explicitly drains all frames during unregistration.
+
+        Raises:
+            ValueError: If the override is negative.
         """
         limit = self.outbound_batch_limit if max_tasks is None else max_tasks
         if limit < 0:
@@ -615,11 +637,25 @@ class BlockingRequestHandler(RequestHandlerBase[ResponseType]):
         payload_clss: list[Any],
         response_cls: ResponseType,
         handler: Callable[..., ResponseType],
-    ):
+        *,
+        observer: PPWaitObserver | None = None,
+        operation: str = "",
+    ) -> None:
+        """Wrap a blocking handler, optionally measuring CPU queue boundaries.
+
+        Args:
+            payload_clss: Codec types in declared payload order.
+            response_cls: Declared response codec type.
+            handler: Original callable executed by the assigned executor.
+            observer: Explicit private PP observer, or None for the original path.
+            operation: RPC name used for aggregate metric keys.
+        """
         self.executor: ThreadPoolExecutor | AffinityThreadPool | None = None
         self.payload_clss = payload_clss
         self.handler = handler
         self.response_cls = response_cls
+        self.observer = observer
+        self.operation = operation
 
     def __call__(
         self, payloads: list[bytes], affinity_key: int = 0
@@ -629,11 +665,28 @@ class BlockingRequestHandler(RequestHandlerBase[ResponseType]):
             "Call add_normal_thread_pool or add_affinity_thread_pool first."
         )
         decoded_payloads = unwrap_request_payloads(payloads, self.payload_clss)
+        handler = self.handler
+        if self.observer is not None:
+            observer = self.observer
+            enqueued = time.monotonic_ns()
+
+            def observed_handler(*args: Any) -> ResponseType:
+                started = time.monotonic_ns()
+                try:
+                    return self.handler(*args)
+                finally:
+                    ended = time.monotonic_ns()
+                    observer.record(self.operation + ".queue_ns", started - enqueued)
+                    observer.record(
+                        self.operation + ".handler_ns", ended - started
+                    )
+
+            handler = observed_handler
         if isinstance(self.executor, AffinityThreadPool):
             return self.executor.submit(
-                self.handler, *decoded_payloads, affinity_key=affinity_key
+                handler, *decoded_payloads, affinity_key=affinity_key
             )
-        return self.executor.submit(self.handler, *decoded_payloads)
+        return self.executor.submit(handler, *decoded_payloads)
 
     def get_response_class(self) -> ResponseType:
         return self.response_cls
@@ -660,6 +713,8 @@ class NonBlockingRequestHandler(Generic[ResponseType, StateType]):
 
 class MessageQueueServer(RequestServer):
     def __init__(self, bind_url: str, context: zmq.Context) -> None:
+        # Enabled only in an explicitly selected private PP server process.
+        self._pp_control_observer = create_pp_wait_observer(True, "control", bind_url)
         # Socket
         self.ctx = context
         self.socket = self.ctx.socket(zmq.ROUTER)
@@ -1000,7 +1055,11 @@ class MessageQueueServer(RequestServer):
         self, rpc_spec: RpcSpec, handler: Callable[..., Any]
     ) -> None:
         self.handlers[rpc_spec.operation] = BlockingRequestHandler(
-            list(rpc_spec.payload_types), rpc_spec.response_type, handler
+            list(rpc_spec.payload_types), rpc_spec.response_type, handler,
+            observer=(self._pp_control_observer if rpc_spec.operation in {
+                "ping", "lookup", "query_prefetch_status", "end_session"
+            } else None),
+            operation=rpc_spec.operation,
         )
 
     def add_nonblocking_handler(

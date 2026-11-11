@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """CPU contracts executing actual transport methods with queue/socket substitutes."""
 import ast
 import itertools

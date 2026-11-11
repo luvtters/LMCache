@@ -86,6 +86,7 @@ from lmcache.integration.vllm.utils import (
 from lmcache.utils import CacheRemoveEvent
 from lmcache.utils import init_logger as lmcache_init_logger
 from lmcache.v1.multiprocess.pp_layout import PPStageLocator
+from lmcache.v1.multiprocess.pp_wait_observer import create_pp_wait_observer
 
 try:
     # First Party
@@ -832,6 +833,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         # Requests whose scheduler explicitly requested delayed freeing.
         self._delay_free_req_ids: set[str] = set()
+        self._pp_wait_observer = create_pp_wait_observer(
+            parallel_strategy.pp_stage_local and parallel_strategy.pp_size > 1,
+            "block_hold", str(self.role)
+        )
 
         if self.role == KVConnectorRole.SCHEDULER:
             # Banner from the scheduler role only, so tensor-parallel
@@ -1620,6 +1625,18 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         Args:
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
+        observer = getattr(self, "_pp_wait_observer", None)
+        if observer is not None:
+            observer.record(
+                "scheduled_tokens", sum(scheduler_output.num_scheduled_tokens.values())
+            )
+            observer.record(
+                "scheduled_requests", len(scheduler_output.num_scheduled_tokens)
+            )
+            observer.record(
+                "preempted_requests",
+                len(getattr(scheduler_output, "preempted_req_ids", ()) or ()),
+            )
         metadata = LMCacheMPConnectorMetadata()
         metadata.need_flush_before_forward = _has_preemption_reqs(scheduler_output)
         metadata.delay_free_req_ids = self._delay_free_req_ids
@@ -1652,6 +1669,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             connector_output (KVConnectorOutput): the worker-side
                 connectors output.
         """
+        observer = getattr(self, "_pp_wait_observer", None)
+        if observer is not None:
+            for request_id in connector_output.finished_sending or ():
+                observer.delay_notice(request_id)
         kv_cache_events = connector_output.kv_cache_events
         if kv_cache_events and isinstance(kv_cache_events, LMCacheMPKVEvents):
             # One aggregated batch per step keeps the workers' event order.
@@ -1731,6 +1752,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         self.scheduler_adapter.end_session(request.request_id)
         if delay_free:
             self._delay_free_req_ids.add(request.request_id)
+            observer = getattr(self, "_pp_wait_observer", None)
+            if observer is not None:
+                observer.delay_free(request.request_id, len(block_ids))
         return delay_free, (return_params or None)
 
     def request_finished_all_groups(

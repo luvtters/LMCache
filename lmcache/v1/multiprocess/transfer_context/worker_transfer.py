@@ -452,6 +452,16 @@ class TransferContext(ABC):
         before they are read.
         """
 
+    @property
+    def tracked_store_count(self) -> int:
+        """Return tracked STORE handles without querying or draining them."""
+        return 0
+
+    @property
+    def last_flush_pending_count(self) -> int:
+        """Return the last flush's pending count, without extra device queries."""
+        return 0
+
 
 class LMCacheDrivenTransferContext(TransferContext):
     """LMCache-driven IPC + MQ future transport context.
@@ -474,6 +484,7 @@ class LMCacheDrivenTransferContext(TransferContext):
         self._mq_timeout: float = 0.0
         self._inflight_stores: list[MessagingFuture] = []
         self._inflight_lock = threading.Lock()
+        self._last_flush_pending_count = 0
 
     @staticmethod
     def _store_settled(future: MessagingFuture) -> bool:
@@ -771,6 +782,18 @@ class LMCacheDrivenTransferContext(TransferContext):
         self._device = None
         self._event_backend = None
 
+    @property
+    def tracked_store_count(self) -> int:
+        """Count retained handles, including completed handles not yet pruned."""
+        with self._inflight_lock:
+            return len(self._inflight_stores)
+
+    @property
+    def last_flush_pending_count(self) -> int:
+        """Return the pending count captured by the original flush selection."""
+        with self._inflight_lock:
+            return self._last_flush_pending_count
+
     def flush_inflight_stores(self) -> None:
         """Block until the server has finished reading the engine KV blocks.
 
@@ -786,6 +809,7 @@ class LMCacheDrivenTransferContext(TransferContext):
         """
         with self._inflight_lock:
             pending = [f for f in self._inflight_stores if not self._store_settled(f)]
+            self._last_flush_pending_count = len(pending)
             self._inflight_stores = []
         for future in pending:
             try:

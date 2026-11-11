@@ -58,6 +58,7 @@ from lmcache.v1.multiprocess.pp_layout import (
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 from lmcache.v1.multiprocess.read_policy import get_read_policy
 from lmcache.v1.multiprocess.lookup_control_cleanup import LookupControlRegistry
+from lmcache.v1.multiprocess.pp_wait_observer import create_pp_wait_observer
 from lmcache.v1.multiprocess.transfer_context import (
     LMCacheDrivenTransferContext,
     TransferContext,
@@ -138,6 +139,8 @@ class ExtraConfigDefault(enum.Enum):
     nonblocking_lookup_status = True
     # Experimental stage-local PP lookup path; deployment is L1-only.
     pp_query_fastpath = False
+    # Per-client send budget for opt-in PP control progress; zero drains all.
+    pp_control_outbound_budget = 0
     # Routing mode for ``create_transfer_context``: ``auto`` resolves to
     # the device spec's declared default (derived from
     # ``is_lmcache_driven_available()``: CUDA and NPU -> lmcache_driven;
@@ -747,14 +750,11 @@ class LMCacheMPSchedulerAdapter:
         )
         assert len(server_urls) >= 1, "At least one server url required"
         self._server_urls: list[str] = list(server_urls)
-        self.req_clients: dict[str, RequestClient] = {
-            url: RequestClientFactory.create(url, context=context)
-            for url in self._server_urls
-        }
         self._nonblocking_lookup_status = (
             ExtraConfigDefault.nonblocking_lookup_status.default
         )
         self._pp_query_fastpath = ExtraConfigDefault.pp_query_fastpath.default
+        outbound_budget = ExtraConfigDefault.pp_control_outbound_budget.default
         if extra_config is not None:
             cfg = _resolve_extra_config(extra_config)
             mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
@@ -763,6 +763,7 @@ class LMCacheMPSchedulerAdapter:
                 ExtraConfigDefault.nonblocking_lookup_status.name
             ]
             self._pp_query_fastpath = cfg[ExtraConfigDefault.pp_query_fastpath.name]
+            outbound_budget = cfg[ExtraConfigDefault.pp_control_outbound_budget.name]
         if self._pp_query_fastpath and not (
             parallel_strategy.pp_stage_local
             and parallel_strategy.pp_size > 1
@@ -775,6 +776,29 @@ class LMCacheMPSchedulerAdapter:
                 "pp_query_fastpath requires stage-local PP>1, one distinct server "
                 "per stage, transfer_borrow and nonblocking STATUS; deploy L1-only"
             )
+        if outbound_budget < 0 or (outbound_budget and not (
+            parallel_strategy.pp_stage_local and parallel_strategy.pp_size > 1
+            and len(server_urls) == parallel_strategy.pp_size
+            and len(set(server_urls)) == len(server_urls)
+        )):
+            raise ValueError(
+                "pp_control_outbound_budget requires stage-local PP>1 "
+                "and one server per stage"
+            )
+        if outbound_budget and any(
+            url.strip().split("://", 1)[0].lower() in ("grpc", "grpc+unix")
+            for url in server_urls
+        ):
+            raise ValueError("pp_control_outbound_budget requires ZMQ endpoints")
+        self.req_clients: dict[str, RequestClient] = {
+            url: RequestClientFactory.create(
+                url, context=context, outbound_batch_limit=outbound_budget
+            ) for url in self._server_urls
+        }
+        self._pp_lookup_observer = create_pp_wait_observer(
+            parallel_strategy.pp_stage_local and parallel_strategy.pp_size > 1,
+            "lookup", ",".join(server_urls)
+        )
         self._mq_timeout = mq_timeout
 
         # Lookup state tracking:
@@ -1111,6 +1135,9 @@ class LMCacheMPSchedulerAdapter:
             in LMCache (prefix matching), or
             None if the lookup request is not finished yet.
         """
+        observer = getattr(self, "_pp_lookup_observer", None)
+        if observer is not None:
+            observer.record("polls")
         if request_id not in self._pending_lookups:
             # No job — either unhealthy at submit time or already cleaned up.
             # Return the cached aggregate if any, otherwise 0.
@@ -1157,6 +1184,8 @@ class LMCacheMPSchedulerAdapter:
                 # Acknowledgement still in flight; poll again next step.
                 if not self._pp_query_fastpath:
                     return None
+                if observer is not None:
+                    observer.record("pending_ack", len(ack.futures))
             else:
                 del self._unacked_lookups[request_id]
 
@@ -1183,6 +1212,8 @@ class LMCacheMPSchedulerAdapter:
 
         for url, (fut, submitted_at) in list(futures.items()):
             if self._nonblocking_lookup_status and not fut.query():
+                if observer is not None:
+                    observer.record("pending_status")
                 if (time.monotonic() >= deadline if deadline is not None else
                         time.monotonic() - submitted_at >= self._mq_timeout):
                     self._mark_lookup_timed_out(url)
@@ -1215,6 +1246,8 @@ class LMCacheMPSchedulerAdapter:
                 # The common prefix is empty regardless of outstanding peers.
                 # Keep their controls for normal request-end ordering.
                 self._finished_lookup_results[request_id] = 0
+                if observer is not None:
+                    observer.record("early_miss")
                 return 0
 
         if len(per_server) < len(self._server_urls):
@@ -1574,6 +1607,7 @@ class LMCacheMPWorkerAdapter:
             legacy_block_size,
             mq_timeout,
         )
+        outbound_budget = ExtraConfigDefault.pp_control_outbound_budget.default
         self._mp_server_launcher = None
         hash_algorithm = ExtraConfigDefault.hash_algorithm.default
         if extra_config is not None:
@@ -1595,6 +1629,7 @@ class LMCacheMPWorkerAdapter:
                     zmq_context=context,
                 )
             cfg = _resolve_extra_config(extra_config)
+            outbound_budget = cfg[ExtraConfigDefault.pp_control_outbound_budget.name]
             mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
             heartbeat_interval = cfg[ExtraConfigDefault.heartbeat_interval.name]
             hash_algorithm = cfg[ExtraConfigDefault.hash_algorithm.name]
@@ -1615,7 +1650,19 @@ class LMCacheMPWorkerAdapter:
             )
         else:
             self._mp_transfer_mode = None
-        self.req_client = RequestClientFactory.create(server_url, context=context)
+        if outbound_budget < 0 or (outbound_budget and not (
+            parallel_strategy.pp_stage_local and parallel_strategy.pp_size > 1
+            and pp_stage_locator is not None
+        )):
+            raise ValueError(
+                "pp_control_outbound_budget requires a stage-local PP>1 worker"
+            )
+        self.req_client = RequestClientFactory.create(
+            server_url, context=context, outbound_batch_limit=outbound_budget
+        )
+        self._pp_wait_observer = create_pp_wait_observer(
+            pp_stage_locator is not None, "store_wait", server_url
+        )
         self._mq_timeout = mq_timeout
 
         # Instance id for GPU worker. uuid4-derived (OS entropy) rather
@@ -2119,6 +2166,13 @@ class LMCacheMPWorkerAdapter:
             self.blocks_in_chunk,
         )
         self.store_futures[request_id] = future
+        observer = getattr(self, "_pp_wait_observer", None)
+        if observer is not None:
+            submitted = observer.store_submitted(request_id)
+            raw_future = getattr(future, "raw_future_", future)
+            raw_future.add_done_callback(
+                lambda _future: observer.store_rpc_ready(submitted)
+            )
         if event is not None:
             self.store_events[request_id] = event
         if self._kv_events_enabled and not self._kv_event_server_source:
@@ -2432,6 +2486,9 @@ class LMCacheMPWorkerAdapter:
             if not s_future.query():
                 continue
 
+            observer = getattr(self, "_pp_wait_observer", None)
+            if observer is not None:
+                observer.store_device_seen(request_id)
             s_result = s_future.result(timeout=60)
             finished_stores.add(request_id)
 
@@ -2507,6 +2564,10 @@ class LMCacheMPWorkerAdapter:
                 kv_rank=self.worker_id,
             )
 
+        observer = getattr(self, "_pp_wait_observer", None)
+        if observer is not None:
+            for request_id in ret_stores or ():
+                observer.store_reported(request_id)
         return ret_stores, finished_retrieves
 
     # TODO(chunxiaozheng): There are some duplicated codes
@@ -2738,14 +2799,31 @@ class LMCacheMPWorkerAdapter:
         Args:
             need_flush_before_forward: When True, flush in-flight gather
                 operations on the transfer context. When False, this is a no-op.
+
+        Optional PP observation times the existing flush and synchronization
+        separately; it never adds a device query or changes their ordering.
         """
         if not need_flush_before_forward:
             return
         if not self.is_healthy or self.transfer_ctx is None:
             return
-        self.transfer_ctx.flush_inflight_stores()
-        # Force device sync here, compare to preemption, perf panelty is trivial
-        torch_dev.synchronize()
+        observer = getattr(self, "_pp_wait_observer", None)
+        if observer is None:
+            self.transfer_ctx.flush_inflight_stores()
+            torch_dev.synchronize()
+            return
+        observer.record("flush_pending_tracked", self.transfer_ctx.tracked_store_count)
+        started = time.monotonic_ns()
+        try:
+            self.transfer_ctx.flush_inflight_stores()
+        finally:
+            observer.record("flush_ns", time.monotonic_ns() - started)
+            observer.record("flush_pending", self.transfer_ctx.last_flush_pending_count)
+        started = time.monotonic_ns()
+        try:
+            torch_dev.synchronize()
+        finally:
+            observer.record("sync_ns", time.monotonic_ns() - started)
 
     def _build_store_kv_events(
         self,

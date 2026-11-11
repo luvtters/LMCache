@@ -53,8 +53,8 @@ class RequestClientFactory:
             A method-oriented request client for the selected transport.
 
         Raises:
-            ValueError: If the URL is empty, malformed, or uses an unsupported
-                scheme.
+            ValueError: If the URL is empty, malformed, unsupported, or the
+                budget is negative or nonzero for gRPC.
         """
         if outbound_batch_limit < 0:
             raise ValueError("outbound_batch_limit must be nonnegative")
