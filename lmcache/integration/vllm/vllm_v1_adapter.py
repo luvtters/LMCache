@@ -1654,6 +1654,9 @@ class LMCacheConnectorV1Impl:
         for finished_req_id in scheduler_output.finished_req_ids:
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
+            # A lookup may finish before the request ever receives KV blocks.
+            self.load_specs.pop(finished_req_id, None)
+            self._requests_priority.pop(finished_req_id, None)
 
         # We should load KV for:
         # 1. new requests
