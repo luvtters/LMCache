@@ -287,6 +287,8 @@ class ReqMeta:
     disagg_spec: Optional[DisaggSpec] = None
     # the configs of the request
     request_configs: Optional[dict] = None
+    # Snapshot for device backends with independent vLLM allocation groups.
+    block_tables: tuple[tuple[int, ...], ...] | None = None
 
     @staticmethod
     def from_request_tracker(
@@ -444,6 +446,8 @@ class LMCacheConnectorMetadata(KVConnectorMetadata):
 
 
 class LMCacheConnectorV1Impl:
+    service_factory_cls = VllmServiceFactory
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -470,7 +474,7 @@ class LMCacheConnectorV1Impl:
         self._apply_extra_config(config, vllm_config)
         self.config = config
 
-        service_factory = VllmServiceFactory(config, vllm_config, role.name.lower())
+        service_factory = self.service_factory_cls(config, vllm_config, role.name.lower())
         self._manager = LMCacheManager(config, service_factory, connector=self)
 
         # Start services managed by LMCacheManager
@@ -811,7 +815,10 @@ class LMCacheConnectorV1Impl:
 
             tokens = request.token_ids
             # TODO: have a pre-allocated buffer to hold the slot_mappings
-            slot_mapping = request.slot_mapping.to(self.device)
+            block_tables = getattr(request, "block_tables", None)
+            slot_mapping = request.slot_mapping
+            if block_tables is None:
+                slot_mapping = slot_mapping.to(self.device)
             assert len(tokens) == len(slot_mapping)
 
             token_mask = torch.ones(len(tokens), dtype=torch.bool)
@@ -860,6 +867,7 @@ class LMCacheConnectorV1Impl:
                     vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                     request_configs=request.request_configs,
                     req_id=request.req_id,
+                    **({"block_tables": block_tables} if block_tables is not None else {}),
                 )
                 if not self.async_loading:
                     # Blocking retrieve releases get references, not lookup pins.
@@ -872,6 +880,15 @@ class LMCacheConnectorV1Impl:
                 num_expected_tokens = (
                     lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
                 )
+                if block_tables is not None:
+                    # The first retrieved chunk may overlap a local APC prefix.
+                    # Only count positions that actually require external KV.
+                    if ret_token_mask.numel() != lmcache_cached_tokens:
+                        raise RuntimeError(f"Invalid retrieve mask for {request.req_id}")
+                    num_retrieved_tokens = ret_token_mask[
+                        request.load_spec.vllm_cached_tokens:
+                    ].sum().item()
+                    token_mask[:request.load_spec.vllm_cached_tokens] = False
                 if num_retrieved_tokens < num_expected_tokens:
                     logger.error(
                         "Request %s"

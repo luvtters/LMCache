@@ -71,10 +71,15 @@ class LMCacheMetadata:
     engine_id: Optional[str] = None
     """ extra config from kv_connector (e.g., lmcache_rpc_port) """
     kv_connector_extra_config: Optional[dict] = None
+    # Global storage owner for this TP group. Collective src stays group-local.
+    storage_owner_rank: Optional[int] = None
 
     def is_first_rank(self) -> bool:
         """Check if the current worker is the first rank"""
-        return self.worker_id == self.first_rank
+        owner = (
+            self.first_rank if self.storage_owner_rank is None else self.storage_owner_rank
+        )
+        return self.worker_id == owner
 
     def get_dtypes(self) -> list[torch.dtype]:
         """Return per-group dtypes, or the legacy single dtype if the

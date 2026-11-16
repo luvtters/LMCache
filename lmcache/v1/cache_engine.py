@@ -2199,6 +2199,10 @@ class LMCacheEngineBuilder:
                 logger.info("Cache engine closed successfully")
             except Exception as e:
                 logger.error("Error closing cache engine: %s", e)
+                if getattr(engine.metadata, "storage_owner_rank", None) is not None:
+                    # An in-flight Ascend STORE may still own its allocator.
+                    # Keep the registered engine available for a later drain.
+                    raise
 
             try:
                 logger.info("Cleaning up instance dictionaries...")

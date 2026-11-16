@@ -28,6 +28,8 @@ logger = init_logger(__name__)
 
 
 class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
+    adapter_cls = None
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -42,7 +44,8 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             )
         else:
             super().__init__(vllm_config=vllm_config, role=role)
-        self._lmcache_engine = LMCacheConnectorV1Impl(vllm_config, role, self)
+        adapter_cls = self.adapter_cls or LMCacheConnectorV1Impl
+        self._lmcache_engine = adapter_cls(vllm_config, role, self)
 
     # ==============================
     # Worker-side methods
